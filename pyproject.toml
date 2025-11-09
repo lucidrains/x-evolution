@@ -23,6 +23,7 @@ classifiers=[
 ]
 
 dependencies = [
+    "accelerate",
     "einops>=0.8.0",
     "torch>=2.4",
     "x-mlps-pytorch>=0.1.6",
