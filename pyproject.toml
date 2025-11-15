@@ -24,9 +24,10 @@ classifiers=[
 
 dependencies = [
     "accelerate",
+    "beartype",
     "einops>=0.8.0",
     "torch>=2.4",
-    "x-mlps-pytorch>=0.1.6",
+    "x-mlps-pytorch>=0.1.8",
     "x-transformers>=2.11.23"
 ]
 
