@@ -2,7 +2,7 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
-from torch import tensor
+from torch import tensor, is_tensor
 from torch.nn import Module
 import torch.nn.functional as F
 from torch.func import functional_call, vmap
@@ -16,6 +16,10 @@ from x_mlps_pytorch.noisable import (
     Noisable,
     with_seed
 )
+
+# constants
+
+MAX_SEED_VALUE = int(2 ** 32)
 
 # helper functions
 
@@ -40,6 +44,8 @@ class EvoStrategy(Module):
         environment: Callable[[Module], float],  # the environment is simply a function that takes in the model and returns a fitness score
         num_generations,
         population_size = 30,
+        learning_rate = 1e-3, # todo - optimizer
+        noise_scale = 1e-3,   # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
         param_names_to_optimize: list[str] | None = None,
         fitness_to_weighted_factor: Callable[[Tensor], Tensor] = normalize,
         cpu = False,
@@ -83,36 +89,100 @@ class EvoStrategy(Module):
 
         self.fitness_to_weighted_factor = fitness_to_weighted_factor
 
+        self.noise_scale = noise_scale
+        self.learning_rate = learning_rate
+
         self.register_buffer('_dummy', tensor(0), persistent = False)
 
     @property
     def device(self):
         return self._dummy.device
 
+    def print(self, *args, **kwargs):
+        return self.accelerate.print(*args, **kwargs)
+
+    @torch.inference_mode()
     def evolve_(
         self,
-        fitnesses: list[float] | Tensor
+        fitnesses: list[float] | Tensor,
+        seeds_for_population: list[int] | Tensor
     ):
+        model = self.noisable_model
+
         if isinstance(fitnesses, list):
             fitnesses = tensor(fitnesses)
 
+        if isinstance(seeds_for_population, list):
+            seeds_for_population = tensor(seeds_for_population)
+
         fitnesses = fitnesses.to(self.device)
+        seeds_for_population.to(self.device)
 
         # they use a simple z-score for the fitnesses, need to figure out the natural ES connection
 
         noise_weights = self.fitness_to_weighted_factor(fitnesses)
 
+        noise_weights *= self.learning_rate # some learning rate that subsumes another constant
+
+        # update one seed at a time for enabling evolutionary strategy for large models
+
+        for individual_seed, noise_weight in zip(seeds_for_population.tolist(), noise_weights.tolist()):
+
+            individual_param_seeds = with_seed(individual_seed)(torch.randint)(0, MAX_SEED_VALUE, (self.num_params,))
+
+            noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
+
+            # set the noise weight
+
+            noise_config = {param_name: (seed, noise_weight) for param_name, seed in noise_config.items()}
+
+            # now update
+
+            model.add_noise_(noise_config)
+
+    @torch.inference_mode()
     def forward(
         self
     ):
 
-        fitnesses = []
+        model = self.noisable_model
 
-        for _ in range(self.num_generations):
+        for index in range(self.num_generations):
+            generation = index + 1
 
-            with self.noisable_model.temp_add_noise_(dict()):
-                fitness = self.environment(noisable_model)
+            fitnesses = []
 
-            fitnesses.append(fitness)
+            # predetermine the seeds for each population
+            # each seed is then used as a seed for all the parameters
 
-        self.evolve_(fitnesses)
+            seeds_for_population = torch.randint(0, MAX_SEED_VALUE, (self.population_size,))
+
+            # now loop through the entire population of noise
+
+            for individual_seed in seeds_for_population.tolist():
+
+                individual_param_seeds = with_seed(individual_seed)(torch.randint)(0, MAX_SEED_VALUE, (self.num_params,))
+
+                noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
+                noise_config = {param_name: (seed, self.noise_scale) for param_name, seed in noise_config.items()}
+
+                with model.temp_add_noise_(noise_config):
+                    fitness = self.environment(model)
+
+                    if is_tensor(fitness):
+                        assert fitness.numel() == 1
+                        fitness = fitness.item()
+
+                fitnesses.append(fitness)
+
+            # normalize the fitness and weighted sum of all the noise is the update
+
+            fitnesses = tensor(fitnesses).float()
+
+            self.evolve_(fitnesses, seeds_for_population)
+
+            # log
+
+            self.print(f'[{generation}] average fitness: {fitnesses.mean():.3f} | fitness std: {fitnesses.std():.3f}')
+
+        self.print('evolution complete')

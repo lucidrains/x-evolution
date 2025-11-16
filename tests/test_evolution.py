@@ -16,4 +16,4 @@ def test_evo_strat():
         num_generations = 100
     )
 
-    evo_strat.evolve_(torch.randn(10))
+    evo_strat()
