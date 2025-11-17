@@ -6,10 +6,8 @@ import torch
 from torch import tensor, is_tensor, arange, randint
 from torch.nn import Module
 import torch.nn.functional as F
-from torch.func import functional_call, vmap
 
 from beartype import beartype
-from beartype.door import is_bearable
 
 from accelerate import Accelerator
 
@@ -32,9 +30,6 @@ def default(v, d):
 
 def normalize(t, eps = 1e-6):
     return F.layer_norm(t, t.shape[-1:], eps = eps)
-
-def round_up_mult(num, mult):
-    return ceil(num / mult) * mult
 
 # class
 
@@ -171,14 +166,13 @@ class EvoStrategy(Module):
             # predetermine the seeds for each population
             # each seed is then used as a seed for all the parameters
 
+            synced_seed = None
+
             if is_distributed:
                 seed_for_pop = randint(0, int(1e9), (), device = self.device)
                 synced_seed = self.accelerate.reduce(seed_for_pop, reduction = 'sum').item()
-                randint_for_seed_pop = with_seed(synced_seed)(randint)
-            else:
-                randint_for_seed_pop = randint
 
-            seeds_for_population = randint_for_seed_pop(0, MAX_SEED_VALUE, (pop_size_round_up,))
+            seeds_for_population = with_seed(synced_seed)(randint)(0, MAX_SEED_VALUE, (pop_size_round_up,))
 
             # divy up work across machine
 
@@ -194,7 +188,7 @@ class EvoStrategy(Module):
                     fitnesses.append(0)
                     continue
 
-                individual_param_seeds = with_seed(individual_seed)(torch.randint)(0, MAX_SEED_VALUE, (self.num_params,))
+                individual_param_seeds = with_seed(individual_seed)(randint)(0, MAX_SEED_VALUE, (self.num_params,))
 
                 noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
                 noise_config = {param_name: (seed, self.noise_scale) for param_name, seed in noise_config.items()}
