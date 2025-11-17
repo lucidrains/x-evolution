@@ -4,10 +4,11 @@ from math import ceil
 
 import torch
 from torch import tensor, is_tensor, arange, randint
-from torch.nn import Module
+from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
 from beartype import beartype
+from beartype.door import is_bearable
 
 from accelerate import Accelerator
 
@@ -45,7 +46,7 @@ class EvoStrategy(Module):
         noise_population_size = 30,
         learning_rate = 1e-3, # todo - optimizer
         noise_scale = 1e-3,   # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
-        param_names_to_optimize: list[str] | None = None,
+        params_to_optimize: list[str] | list[Parameter] | None = None,
         fitness_to_weighted_factor: Callable[[Tensor], Tensor] = normalize,
         cpu = False,
         accelerate_kwargs: dict = dict(),
@@ -59,20 +60,29 @@ class EvoStrategy(Module):
 
         self.environment = environment
 
-        param_names = set(dict(model.named_parameters()).keys())
+        named_parameters_dict = dict(model.named_parameters())
+
+        param_to_name_index = {param: name for name, param in named_parameters_dict.items()}
+
+        param_names = set(named_parameters_dict.keys())
 
         # default to all parameters to optimize with evo strategy
 
-        param_names_to_optimize = default(param_names_to_optimize, param_names)
+        params_to_optimize = default(params_to_optimize, param_names)
+
+        # if given as list of Parameter, convert to names
+
+        if is_bearable(params_to_optimize, list[Parameter]):
+            params_to_optimize = [param_to_name_index[param] for param in set(params_to_optimize)]
 
         # validate
 
-        assert all([name in param_names for name in param_names_to_optimize])
-        assert len(param_names_to_optimize) > 0, 'nothing to optimize'
+        assert all([name in param_names for name in params_to_optimize])
+        assert len(params_to_optimize) > 0, 'nothing to optimize'
 
         # sort param names and store
 
-        param_names_list = list(param_names_to_optimize)
+        param_names_list = list(params_to_optimize)
         param_names_list.sort()
 
         self.param_names_to_optimize = param_names_list

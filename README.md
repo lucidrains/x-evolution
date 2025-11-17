@@ -31,7 +31,8 @@ evo_strat = EvoStrategy(
     noise_population_size = 30,
     num_generations = 100,
     learning_rate = 1e-3,
-    noise_scale = 1e-3
+    noise_scale = 1e-3,
+    to_optimize = None # can be [str {param name}] or [Parameter]
 )
 
 # do evolution with your desired fitness function for so many generations
