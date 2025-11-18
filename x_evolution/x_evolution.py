@@ -112,9 +112,8 @@ class EvoStrategy(Module):
 
         self.checkpoint_every = checkpoint_every
 
-        if exists(checkpoint_every):
-            self.checkpoint_folder = Path(checkpoint_path)
-            self.checkpoint_folder.mkdir(exist_ok = True)
+        self.checkpoint_folder = Path(checkpoint_path)
+        self.checkpoint_folder.mkdir(exist_ok = True)
 
     @property
     def device(self):

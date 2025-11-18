@@ -39,9 +39,8 @@ evo_strat = EvoStrategy(
 
 evo_strat()
 
-# then save your evolved model, maybe for alternating with gradient based training
-
-torch.save(model.state_dict(), './evolved.pt')
+# model will be saved under checkpoints/ folder
+# can also specify checkpoint_every at init and select the one with your favored fitness score for continued policy gradient learning etc
 ```
 
 ## Distributed
