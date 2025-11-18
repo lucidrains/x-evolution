@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import Callable
+
 from math import ceil
+from pathlib import Path
 
 import torch
 from torch import tensor, is_tensor, arange, randint
@@ -29,6 +31,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def divisible_by(num, den):
+    return (num % den) == 0
+
 def normalize(t, eps = 1e-6):
     return F.layer_norm(t, t.shape[-1:], eps = eps)
 
@@ -44,10 +49,12 @@ class EvoStrategy(Module):
         environment: Callable[[Module], float],  # the environment is simply a function that takes in the model and returns a fitness score
         num_generations,
         noise_population_size = 30,
-        learning_rate = 1e-3, # todo - optimizer
-        noise_scale = 1e-3,   # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
+        learning_rate = 1e-3,               # todo - optimizer
+        noise_scale = 1e-3,                 # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
         params_to_optimize: list[str] | list[Parameter] | None = None,
         fitness_to_weighted_factor: Callable[[Tensor], Tensor] = normalize,
+        checkpoint_every = None,            # saving every number of generations
+        checkpoint_path = './checkpoints',
         cpu = False,
         accelerate_kwargs: dict = dict(),
     ):
@@ -100,6 +107,14 @@ class EvoStrategy(Module):
 
         self.noise_scale = noise_scale
         self.learning_rate = learning_rate
+
+        # checkpointing
+
+        self.checkpoint_every = checkpoint_every
+
+        if exists(checkpoint_every):
+            self.checkpoint_folder = Path(checkpoint_path)
+            self.checkpoint_folder.mkdir(exist_ok = True)
 
     @property
     def device(self):
@@ -231,6 +246,19 @@ class EvoStrategy(Module):
             # log
 
             self.print(f'[{generation}] average fitness: {fitnesses.mean():.3f} | fitness std: {fitnesses.std():.3f}')
+
+            # maybe checkpoint
+
+            if (
+                exists(self.checkpoint_every) and
+                divisible_by(generation, self.checkpoint_every) and
+                self.accelerate.is_main_process
+            ):
+
+                filepath = self.checkpoint_folder / f'model.ckpt.{generation}.pt'
+                torch.save(self.model.state_dict(), str(filepath))
+
+            self.accelerate.wait_for_everyone()
 
         self.print('evolution complete')
 
