@@ -46,7 +46,7 @@ class EvoStrategy(Module):
         self,
         model: Module,
         *,
-        environment: Callable[[Module], float],  # the environment is simply a function that takes in the model and returns a fitness score
+        environment: Callable[[Module], float | int | Tensor],  # the environment is simply a function that takes in the model and returns a fitness score
         num_generations,
         noise_population_size = 30,
         learning_rate = 1e-3,               # todo - optimizer
