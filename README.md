@@ -27,7 +27,7 @@ model = torch.nn.Sequential(
 
 evo_strat = EvoStrategy(
     model,
-    environment = lambda model: torch.randint(0, 100, ()), # environment is just a function that takes in the individual model (with unique noise) and outputs the fitness - you can select for whatever you want here, does not have to be differentiable.
+    environment = lambda model: torch.randint(0, 100, ()), # environment is just a function that takes in the individual model (with unique noise) and outputs a scalar (the fitness) the measure you are selecting for
     noise_population_size = 30,
     num_generations = 100,
     learning_rate = 1e-3,
