@@ -7,8 +7,10 @@ from x_mlps_pytorch import MLP
 model = MLP(8, 16, 4)
 
 @param('params_to_optimize', (None, ['layers.1.weight'], [model.layers[1].weight]))
+@param('use_optimizer', (False, True))
 def test_evo_strat(
-    params_to_optimize
+    params_to_optimize,
+    use_optimizer
 ):
     from random import randrange
 
@@ -18,7 +20,8 @@ def test_evo_strat(
         model,
         environment = lambda model: float(randrange(100)),
         num_generations = 1,
-        params_to_optimize = params_to_optimize
+        params_to_optimize = params_to_optimize,
+        use_optimizer = use_optimizer
     )
 
     evo_strat('evolve')

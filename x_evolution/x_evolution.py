@@ -6,6 +6,7 @@ from pathlib import Path
 import torch
 from torch import tensor, is_tensor, arange, randint
 from torch.nn import Module, Parameter
+from torch.optim import Adam
 import torch.nn.functional as F
 
 from beartype import beartype
@@ -48,9 +49,12 @@ class EvoStrategy(Module):
         environment: Callable[[Module], float | int | Tensor],  # the environment is simply a function that takes in the model and returns a fitness score
         num_generations,
         noise_population_size = 30,
-        learning_rate = 1e-3,               # todo - optimizer
+        learning_rate = 1e-3,
         noise_scale = 1e-3,                 # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
         params_to_optimize: list[str] | Module | list[Module] | list[Parameter] | None = None,
+        use_optimizer = False,
+        optimizer_klass = Adam,
+        optimizer_kwargs: dict = dict(),
         fitness_to_weighted_factor: Callable[[Tensor], Tensor] = normalize,
         checkpoint_every = None,            # saving every number of generations
         checkpoint_path = './checkpoints',
@@ -114,6 +118,14 @@ class EvoStrategy(Module):
         self.noise_scale = noise_scale
         self.learning_rate = learning_rate
 
+        # maybe use optimizer to update, allow for Adam
+
+        self.use_optimizer = use_optimizer
+
+        if use_optimizer:
+            optim_params = [named_parameters_dict[name] for name in params_to_optimize]
+            self.optimizer = Adam(optim_params, lr = learning_rate, **optimizer_kwargs)
+
         # rejecting the fitnesses for a certain generation if this function is true
 
         self.reject_generation_fitnesses_if = reject_generation_fitnesses_if
@@ -138,6 +150,7 @@ class EvoStrategy(Module):
         fitnesses: list[float] | Tensor,
         seeds_for_population: list[int] | Tensor
     ):
+        use_optimizer = self.use_optimizer
         model = self.noisable_model
 
         if isinstance(fitnesses, list):
@@ -153,7 +166,8 @@ class EvoStrategy(Module):
 
         noise_weights = self.fitness_to_weighted_factor(fitnesses)
 
-        noise_weights *= self.learning_rate # some learning rate that subsumes another constant
+        if not use_optimizer:
+            noise_weights *= self.learning_rate # some learning rate that subsumes another constant
 
         # update one seed at a time for enabling evolutionary strategy for large models
 
@@ -169,7 +183,11 @@ class EvoStrategy(Module):
 
             # now update
 
-            model.add_noise_(noise_config)
+            model.add_noise_(noise_config, negate = use_optimizer, add_to_grad = use_optimizer)
+
+        if use_optimizer:
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
     def checkpoint(self, filename = 'evolved.model'):
 
