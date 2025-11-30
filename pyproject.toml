@@ -1,6 +1,6 @@
 [project]
 name = "x-evolution"
-version = "0.0.23"
+version = "0.0.24"
 description = "x-evolution"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -28,7 +28,7 @@ dependencies = [
     "beartype",
     "einops>=0.8.0",
     "torch>=2.4",
-    "x-mlps-pytorch>=0.1.21",
+    "x-mlps-pytorch>=0.1.22",
     "x-transformers>=2.11.23"
 ]
 
@@ -37,7 +37,12 @@ Homepage = "https://pypi.org/project/x-evolution/"
 Repository = "https://github.com/lucidrains/x-evolution"
 
 [project.optional-dependencies]
-examples = []
+
+examples = [
+    "gymnasium[box2d]>=1.0.0",
+    "gymnasium[other]"
+]
+
 test = [
     "pytest"
 ]
