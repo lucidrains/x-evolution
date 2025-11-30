@@ -32,6 +32,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t):
+    return t
+
 def divisible_by(num, den):
     return (num % den) == 0
 
@@ -58,6 +61,7 @@ class EvoStrategy(Module):
         use_optimizer = False,
         optimizer_klass = AdamAtan2,
         optimizer_kwargs: dict = dict(),
+        transform_fitness: Callable = identity,
         fitness_to_weighted_factor: Callable[[Tensor], Tensor] = normalize,
         checkpoint_every = None,            # saving every number of generations
         checkpoint_path = './checkpoints',
@@ -117,6 +121,8 @@ class EvoStrategy(Module):
 
         # the function that transforms a tensor of fitness floats to the weight for the weighted average of the noise for rolling out 1x1 ES
 
+        self.transform_fitness = transform_fitness # a function that gets called before converting to weights for the weighted noise update - eventually get rank normalization
+
         self.fitness_to_weighted_factor = fitness_to_weighted_factor
 
         self.mirror_sampling = mirror_sampling # mirror / antithetical sampling - reducing variance by doing positive + negative of noise and subtracting
@@ -168,6 +174,11 @@ class EvoStrategy(Module):
 
         fitnesses = fitnesses.to(self.device)
         seeds_for_population = seeds_for_population.to(self.device)
+
+        # maybe transform fitnesses
+
+        if exists(self.transform_fitness):
+            fitnesses = self.transform_fitness(fitnesses)
 
         # they use a simple z-score for the fitnesses, need to figure out the natural ES connection
 
