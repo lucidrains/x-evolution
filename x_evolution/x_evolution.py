@@ -6,13 +6,14 @@ from pathlib import Path
 import torch
 from torch import tensor, is_tensor, arange, randint
 from torch.nn import Module, Parameter
-from torch.optim import Adam
 import torch.nn.functional as F
 
 from beartype import beartype
 from beartype.door import is_bearable
 
 from accelerate import Accelerator
+
+from adam_atan2_pytorch import AdamAtan2
 
 from x_mlps_pytorch.noisable import (
     Noisable,
@@ -54,7 +55,7 @@ class EvoStrategy(Module):
         params_to_optimize: list[str] | Module | list[Module] | list[Parameter] | None = None,
         noise_low_rank: int | None = None,
         use_optimizer = False,
-        optimizer_klass = Adam,
+        optimizer_klass = AdamAtan2,
         optimizer_kwargs: dict = dict(),
         fitness_to_weighted_factor: Callable[[Tensor], Tensor] = normalize,
         checkpoint_every = None,            # saving every number of generations
