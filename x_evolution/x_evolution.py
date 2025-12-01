@@ -4,7 +4,7 @@ from math import ceil
 from pathlib import Path
 
 import torch
-from torch import tensor, is_tensor, arange, randint
+from torch import tensor, Tensor, is_tensor, arange, randint
 from torch.nn import Module, Parameter
 import torch.nn.functional as F
 
@@ -55,7 +55,7 @@ class EvoStrategy(Module):
         noise_population_size = 30,
         learning_rate = 1e-3,
         noise_scale = 1e-3,                 # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
-        mirror_sampling = False,
+        mirror_sampling = True,
         params_to_optimize: list[str] | Module | list[Module] | list[Parameter] | None = None,
         noise_low_rank: int | None = None,
         use_optimizer = False,
