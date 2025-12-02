@@ -1,3 +1,10 @@
+# /// script
+# dependencies = [
+#     "torchvision",
+#     "x-evolution>=0.0.20"
+# ]
+# ///
+
 import torch
 from torch import tensor, nn
 import torch.nn.functional as F
@@ -6,35 +13,23 @@ from torch.utils.data import DataLoader
 
 # model
 
+from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+
 model = nn.Sequential(
     nn.Flatten(),
-    nn.Linear(784, 512),
-    nn.ReLU(),
-    nn.Linear(512, 256),
-    nn.ReLU(),
-    nn.Linear(256, 128),
-    nn.ReLU(),
-    nn.Linear(128, 64),
-    nn.ReLU(),
-    nn.LayerNorm(64, bias = False),
-    nn.Linear(64, 10),
+    ResidualNormedMLP(dim_in = 784, dim = 512, depth = 8, residual_every = 2, dim_out = 10)
 )
 
 # data
 
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
-
-dataset = datasets.MNIST('./data', train = True, download = True, transform = transform)
+dataset = datasets.MNIST('./data', train = True, download = True, transform = transforms.ToTensor())
 
 # fitness as inverse of loss
 
 def loss_mnist(model):
     device = next(model.parameters()).device
     
-    dataloader = DataLoader(dataset, batch_size = 16, shuffle = True)
+    dataloader = DataLoader(dataset, batch_size = 32, shuffle = True)
     data_iterator = iter(dataloader)
     data, target = next(data_iterator)
 
