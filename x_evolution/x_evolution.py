@@ -7,7 +7,7 @@ from functools import partial
 
 import torch
 from torch import tensor, Tensor, is_tensor, arange, randint
-from torch.nn import Module, Parameter
+from torch.nn import Module, ModuleList, Parameter
 from torch.optim import SGD
 
 import torch.nn.functional as F
@@ -50,7 +50,7 @@ class EvoStrategy(Module):
     @beartype
     def __init__(
         self,
-        model: Module,
+        model: Module | list[Module],
         *,
         environment: Callable[[Module], float | int | Tensor],  # the environment is simply a function that takes in the model and returns a fitness score
         num_generations,
@@ -75,6 +75,9 @@ class EvoStrategy(Module):
         super().__init__()
 
         self.accelerate = Accelerator(cpu = cpu, **accelerate_kwargs)
+
+        if isinstance(model, list):
+            model = ModuleList(model)
 
         self.model = model
         self.noisable_model = Noisable(model, low_rank = noise_low_rank)
