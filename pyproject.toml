@@ -1,6 +1,6 @@
 [project]
 name = "x-evolution"
-version = "0.1.0"
+version = "0.1.1"
 description = "x-evolution"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -24,7 +24,6 @@ classifiers=[
 
 dependencies = [
     "accelerate",
-    "adam-atan2-pytorch",
     "beartype",
     "einops>=0.8.0",
     "torch>=2.4",
