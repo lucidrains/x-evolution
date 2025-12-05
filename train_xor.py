@@ -14,6 +14,8 @@ model = nn.Sequential(
 
 # fitness as inverse of loss
 
+from x_evolution import EvoStrategy
+
 def loss_xor(model):
     device = next(model.parameters()).device
 
@@ -29,8 +31,6 @@ def loss_xor(model):
     return -loss
 
 # evo
-
-from x_evolution import EvoStrategy
 
 evo_strat = EvoStrategy(
     model,
