@@ -118,10 +118,14 @@ class EvoStrategy(Module):
 
         self.param_names_to_optimize = param_names_list
 
-        # index by shapes
+        # shapes
 
         self.param_shapes = {name: param.shape for name, param in named_parameters_dict.items()}
 
+        # dtypes
+
+        self.param_dtypes = {name: param.dtype for name, param in named_parameters_dict.items()}
+ 
         # hyperparameters
 
         self.noise_population_size = noise_population_size
@@ -222,10 +226,11 @@ class EvoStrategy(Module):
             for param_name, seed in noise_config.items():
 
                 shape = self.param_shapes[param_name]
+                dtype = self.param_dtypes[param_name]
 
                 # reproduce the noise from the seed
 
-                noise = with_seed(seed)(model.create_noise_fn)(shape)
+                noise = with_seed(seed)(model.create_noise_fn)(shape, dtype = dtype)
 
                 # set the noise weight
 

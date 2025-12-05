@@ -18,7 +18,7 @@ from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 model = nn.Sequential(
     nn.Flatten(),
     ResidualNormedMLP(dim_in = 784, dim = 512, depth = 8, residual_every = 2, dim_out = 10)
-)
+).half()
 
 batch_size = 128
 
@@ -38,7 +38,7 @@ def loss_mnist(model):
     data, target = data.to(device), target.to(device)
 
     with torch.no_grad():
-        logits = model(data)
+        logits = model(data.half())
         loss = F.cross_entropy(logits, target)
 
     return -loss

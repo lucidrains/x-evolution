@@ -10,7 +10,7 @@ model = nn.Sequential(
     nn.Linear(2, 16),
     nn.ReLU(),
     nn.Linear(16, 2)
-)
+).half()
 
 # fitness as inverse of loss
 
@@ -25,7 +25,7 @@ def loss_xor(model):
     data, labels = tuple(t.to(device) for t in (data, labels))
 
     with torch.no_grad():
-        logits = model(data.float())
+        logits = model(data.half())
         loss = F.cross_entropy(logits, labels)
 
     return -loss
