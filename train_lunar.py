@@ -76,24 +76,17 @@ class LunarEnvironment(Module):
 
 from x_evolution import EvoStrategy
 
-from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
+from x_mlps_pytorch.normed_mlp import MLP
 
-actor = ResidualNormedMLP(
-    dim_in = 8,
-    dim = 24,
-    depth = 3,
-    residual_every = 1,
-    dim_out = 4,
-    final_norm = True
-)
+actor = MLP(8, 24, 24, 4)
 
 evo_strat = EvoStrategy(
     actor,
-    environment = LunarEnvironment(repeats = 2),
+    environment = LunarEnvironment(repeats = 1),
     num_generations = 50_000,
-    noise_population_size = 60,
-    noise_low_rank = 2,
-    noise_scale = 1e-1,
+    noise_population_size = 100,
+    noise_low_rank = 1,
+    noise_scale = 5e-2,
     learned_noise_scale = True,
     use_sigma_optimizer = True,
     learning_rate = 5e-2,

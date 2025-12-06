@@ -63,7 +63,7 @@ class EvoStrategy(Module):
         noise_scale = 1e-2,  # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
         learned_noise_scale = False,
         noise_scale_learning_rate = 5e-3,
-        noise_scale_clamp_range: tuple[float, float] | None = None,
+        noise_scale_clamp_range: tuple[float, float] = (1e-3, None),
         use_optimizer = True,
         optimizer_klass = partial(SGD, nesterov = True, momentum = 0.1, weight_decay = 1e-2),
         optimizer_kwargs: dict = dict(),
@@ -159,10 +159,10 @@ class EvoStrategy(Module):
             self.sigmas = ParameterList([Parameter(torch.ones(()) * noise_scale) for _ in range(len(named_parameters_dict))])
             self.param_name_to_sigma_index = {name: i for i, name in enumerate(named_parameters_dict.keys())}
 
-            self.sigma_clamp_ = identity
+            min_noise_scale, _ = noise_scale_clamp_range
+            assert min_noise_scale > 0.
 
-            if exists(noise_scale_clamp_range):
-                self.sigma_clamp_ = lambda t: t.clamp_(*noise_scale_clamp_range)
+            self.sigma_clamp_ = lambda t: t.clamp_(*noise_scale_clamp_range)
 
         self.noise_scale_learning_rate = noise_scale_learning_rate
 
