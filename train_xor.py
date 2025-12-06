@@ -12,6 +12,8 @@ model = nn.Sequential(
     nn.Linear(16, 2)
 ).half()
 
+batch_size = 128
+
 # fitness as inverse of loss
 
 from x_evolution import EvoStrategy
@@ -19,7 +21,7 @@ from x_evolution import EvoStrategy
 def loss_xor(model):
     device = next(model.parameters()).device
 
-    data = torch.randint(0, 2, (32, 2))
+    data = torch.randint(0, 2, (batch_size, 2))
     labels = data[:, 0] ^ data[:, 1]
 
     data, labels = tuple(t.to(device) for t in (data, labels))

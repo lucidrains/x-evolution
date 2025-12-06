@@ -20,7 +20,7 @@ model = nn.Sequential(
     ResidualNormedMLP(dim_in = 784, dim = 512, depth = 8, residual_every = 2, dim_out = 10)
 ).half()
 
-batch_size = 128
+batch_size = 256
 
 # data
 
