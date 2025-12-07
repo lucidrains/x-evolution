@@ -91,7 +91,7 @@ evo_strat = EvoStrategy(
     learned_noise_scale = True,
     use_sigma_optimizer = True,
     learning_rate = 1e-3,
-    noise_scale_learning_rate = 1e-5
+    noise_scale_learning_rate = 1e-4
 )
 
 evo_strat()
