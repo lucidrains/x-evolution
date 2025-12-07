@@ -83,12 +83,17 @@ class EvoStrategy(Module):
         checkpoint_every = None,            # saving every number of generations
         checkpoint_path = './checkpoints',
         cpu = False,
+        verbose = True,
+        accelerator: Accelerator | None = None,
         accelerate_kwargs: dict = dict(),
         reject_generation_fitnesses_if: Callable[[Tensor], bool] | None = None
     ):
         super().__init__()
 
-        self.accelerate = Accelerator(cpu = cpu, **accelerate_kwargs)
+        if not exists(accelerator):
+            accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
+
+        self.accelerate = accelerator
 
         if isinstance(model, list):
             model = ModuleList(model)
@@ -195,6 +200,10 @@ class EvoStrategy(Module):
 
         self.reject_generation_fitnesses_if = reject_generation_fitnesses_if
 
+        # verbose
+
+        self.verbose = verbose
+
         # checkpointing
 
         self.checkpoint_every = checkpoint_every
@@ -207,6 +216,9 @@ class EvoStrategy(Module):
         return self.accelerate.device
 
     def print(self, *args, **kwargs):
+        if not self.verbose:
+            return
+
         return self.accelerate.print(*args, **kwargs)
 
     def _get_noise_scale(self, param_name):
@@ -302,7 +314,7 @@ class EvoStrategy(Module):
                         self.sigma_optimizer.step()
                         self.sigma_optimizer.zero_grad()
                     else:
-                        sigma.add_(grad_sigma * self.noise_scale_learning_rate)
+                        sigma.add_(one_grad_sigma * self.noise_scale_learning_rate)
 
             # now update params for one seed
 
@@ -333,7 +345,8 @@ class EvoStrategy(Module):
     def forward(
         self,
         filename = 'evolved.model',
-        num_generations = None
+        num_generations = None,
+        disable_distributed = False
     ):
 
         model = self.noisable_model.to(self.device)
@@ -345,8 +358,12 @@ class EvoStrategy(Module):
 
         # get world size, rank, and determine if distributed
 
-        rank = self.accelerate.process_index
-        world_size = self.accelerate.num_processes
+        if disable_distributed:
+            rank, world_size = 0, 1
+        else:
+            rank = self.accelerate.process_index
+            world_size = self.accelerate.num_processes
+
         is_distributed = world_size > 1
 
         # prepare the fitnesses tensor, rounded up to the next multiple of the world size for convenience
@@ -372,6 +389,8 @@ class EvoStrategy(Module):
         num_generations = default(num_generations, self.num_generations)
 
         generation = 1
+
+        fitnesses_across_generations = []
 
         # loop through generations
 
@@ -455,6 +474,10 @@ class EvoStrategy(Module):
             fitnesses = fitnesses[:pop_size]
             seeds_for_population = seeds_for_population[:pop_size]
 
+            # store
+
+            fitnesses_across_generations.append(fitnesses)
+
             # validate fitnesses
 
             if exists(self.reject_generation_fitnesses_if) and self.reject_generation_fitnesses_if(fitnesses):
@@ -492,4 +515,7 @@ class EvoStrategy(Module):
 
         self.checkpoint(f'{filename}.final.{generation}')
 
-        self.accelerate.end_training()
+        # return fitnesses across generations
+        # for meta-evolutionary (nesting EvoStrategy within the environment of another and optimizing some meta-network)
+
+        return fitnesses_across_generations
