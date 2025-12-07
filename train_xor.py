@@ -40,12 +40,11 @@ evo_strat = EvoStrategy(
     noise_population_size = 100,
     noise_low_rank = 1,
     num_generations = 100_000,
-    learning_rate = 1e-2,
+    learning_rate = 1e-1,
     noise_scale = 1e-1,
+    noise_scale_clamp_range = (5e-2, 2e-1),
     learned_noise_scale = True,
-    noise_scale_learning_rate = 5e-3,
-    sigma_optimizer_klass = torch.optim.Adam,
-    sigma_optimizer_kwargs = dict(betas = (0.9, 0.99))
+    noise_scale_learning_rate = 5e-4
 )
 
 evo_strat()

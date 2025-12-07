@@ -52,9 +52,12 @@ evo_strat = EvoStrategy(
     environment = loss_mnist,
     noise_population_size = 100,
     noise_scale = 1e-2,
+    noise_scale_clamp_range = (5e-3, 2e-2),
     noise_low_rank = 2,
     num_generations = 10_000,
-    learning_rate = 1e-3
+    learning_rate = 1e-3,
+    learned_noise_scale = True,
+    noise_scale_learning_rate = 1e-5
 )
 
 evo_strat()
