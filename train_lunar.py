@@ -80,6 +80,8 @@ from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
 
 actor = ResidualNormedMLP(dim_in = 8, dim = 24, depth = 2, residual_every = 1, dim_out = 4)
 
+from torch.optim.lr_scheduler import CosineAnnealingLR
+
 evo_strat = EvoStrategy(
     actor,
     environment = LunarEnvironment(repeats = 2),
@@ -91,7 +93,10 @@ evo_strat = EvoStrategy(
     learned_noise_scale = True,
     use_sigma_optimizer = True,
     learning_rate = 1e-3,
-    noise_scale_learning_rate = 1e-4
+    noise_scale_learning_rate = 1e-4,
+    use_scheduler = True,
+    scheduler_klass = CosineAnnealingLR,
+    scheduler_kwargs = dict(T_max = 50_000)
 )
 
 evo_strat()
