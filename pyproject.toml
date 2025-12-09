@@ -1,6 +1,6 @@
 [project]
 name = "x-evolution"
-version = "0.1.16"
+version = "0.1.17"
 description = "x-evolution"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

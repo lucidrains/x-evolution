@@ -6,7 +6,7 @@ from pathlib import Path
 from functools import partial
 
 import torch
-from torch import tensor, Tensor, is_tensor, arange, randint
+from torch import tensor, Tensor, stack, is_tensor, arange, randint
 from torch.nn import Module, ModuleList, Parameter, ParameterList
 from torch.optim import SGD, Adam, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
@@ -367,8 +367,10 @@ class EvoStrategy(Module):
         filename = 'evolved.model',
         num_generations = None,
         disable_distributed = False,
-        rollback_model_at_end = False
+        rollback_model_at_end = False,
+        verbose = None
     ):
+        verbose = default(verbose, self.verbose)
 
         model = self.noisable_model.to(self.device)
 
@@ -553,4 +555,4 @@ class EvoStrategy(Module):
         # return fitnesses across generations
         # for meta-evolutionary (nesting EvoStrategy within the environment of another and optimizing some meta-network)
 
-        return fitnesses_across_generations
+        return stack(fitnesses_across_generations)
