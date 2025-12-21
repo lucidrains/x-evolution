@@ -6,6 +6,7 @@ from pathlib import Path
 from functools import partial
 
 import torch
+import torch.distributed as dist
 from torch import tensor, Tensor, stack, is_tensor, arange, randint
 from torch.nn import Module, ModuleList, Parameter, ParameterList
 from torch.optim import SGD, Adam, Optimizer
@@ -112,6 +113,8 @@ class EvoStrategy(Module):
                 self.print('pre_main_callback detected on environment passed in and is invoked')
                 environment.pre_main_callback()
 
+        accelerator.wait_for_everyone()
+
         # take care of model and parameters
 
         if isinstance(model, list):
@@ -119,6 +122,13 @@ class EvoStrategy(Module):
 
         self.model = model
         self.noisable_model = Noisable(model, low_rank = noise_low_rank)
+
+        # use prepare and run through environment once to sync params
+
+        wrapped_model = accelerator.prepare(model)
+        environment(wrapped_model)
+
+        # get param dictionary
 
         named_parameters_dict = dict(model.named_parameters())
 
