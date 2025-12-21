@@ -112,6 +112,8 @@ class EvoStrategy(Module):
                 self.print('pre_main_callback detected on environment passed in and is invoked')
                 environment.pre_main_callback()
 
+        accelerator.wait_for_everyone()
+
         # take care of model and parameters
 
         if isinstance(model, list):
@@ -119,6 +121,15 @@ class EvoStrategy(Module):
 
         self.model = model
         self.noisable_model = Noisable(model, low_rank = noise_low_rank)
+
+        # use prepare and run through environment once to sync params
+
+        wrapped_model = accelerator.prepare(model)
+
+        with torch.no_grad():
+            environment(wrapped_model)
+
+        # get param dictionary
 
         named_parameters_dict = dict(model.named_parameters())
 
