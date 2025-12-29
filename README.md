@@ -57,6 +57,8 @@ Then
 $ accelerate launch train.py
 ```
 
+For gymnasium simulations, first run `pip install '[examples]'`
+
 ## Citations
 
 ```bibtex

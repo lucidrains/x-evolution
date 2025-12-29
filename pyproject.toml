@@ -1,6 +1,6 @@
 [project]
 name = "x-evolution"
-version = "0.1.23"
+version = "0.1.25"
 description = "x-evolution"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -39,6 +39,7 @@ Repository = "https://github.com/lucidrains/x-evolution"
 
 examples = [
     "gymnasium[box2d]>=1.0.0",
+    "gymnasium[mujoco]>=1.0.0",
     "gymnasium[other]"
 ]
 
