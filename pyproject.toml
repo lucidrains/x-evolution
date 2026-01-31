@@ -1,6 +1,6 @@
 [project]
 name = "x-evolution"
-version = "0.1.25"
+version = "0.1.26"
 description = "x-evolution"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -27,7 +27,7 @@ dependencies = [
     "beartype",
     "einops>=0.8.0",
     "torch>=2.4",
-    "x-mlps-pytorch>=0.1.31",
+    "x-mlps-pytorch>=0.2.0",
     "x-transformers>=2.11.23"
 ]
 

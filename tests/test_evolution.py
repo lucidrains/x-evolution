@@ -47,3 +47,24 @@ def test_evo_strat(
     evo_strat('more.evolve', 1)
 
     fitnesses = evo_strat('more.evolve', 2, rollback_model_at_end = True)
+
+@param('vector_size', (2, 4))
+def test_evo_strat_vectorized(vector_size):
+    from x_evolution.x_evolution import EvoStrategy
+
+    model = MLP(8, 16, 4)
+
+    def environment(model):
+        # mock a vectorized environment returning multiple fitness scores
+        return torch.randn(vector_size)
+
+    evo_strat = EvoStrategy(
+        model,
+        environment = environment,
+        num_generations = 2,
+        vectorized = True,
+        vector_size = vector_size,
+        noise_population_size = 4
+    )
+
+    evo_strat()

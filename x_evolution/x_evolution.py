@@ -93,10 +93,15 @@ class EvoStrategy(Module):
         verbose = True,
         accelerator: Accelerator | None = None,
         accelerate_kwargs: dict = dict(),
-        reject_generation_fitnesses_if: Callable[[Tensor], bool] | None = None
+        reject_generation_fitnesses_if: Callable[[Tensor], bool] | None = None,
+        vectorized = False,
+        vector_size: int | None = None
     ):
         super().__init__()
         self.verbose = verbose
+
+        self.vectorized = vectorized
+        self.vector_size = vector_size
 
         if not exists(accelerator):
             accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
@@ -475,24 +480,28 @@ class EvoStrategy(Module):
                     fitnesses.append([0., 0.] if self.mirror_sampling else 0.)
                     continue
 
-                individual_param_seeds = with_seed(individual_seed)(randint)(0, MAX_SEED_VALUE, (self.num_params,))
+                def get_fitness(negate = False):
+                    individual_param_seeds = with_seed(individual_seed.item())(randint)(0, MAX_SEED_VALUE, (self.num_params,))
+                    noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
 
-                noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
+                    noise_config_with_scale = dict()
+                    for param_name, seed in noise_config.items():
+                        noise_scale = self._get_noise_scale(param_name)
+                        noise_config_with_scale[param_name] = (seed, noise_scale)
 
-                # determine noise scale, which can be fixed or learned
+                    with model.temp_add_noise_(noise_config_with_scale, negate = negate):
+                        fitness = with_seed(maybe_rollout_seed)(self.environment)(model)
 
-                noise_config_with_scale = dict()
+                    if isinstance(fitness, Tensor) and fitness.numel() > 1:
+                        fitness = fitness.mean().item()
+                    elif isinstance(fitness, Tensor):
+                        fitness = fitness.item()
 
-                for param_name, seed in noise_config.items():
+                    return fitness
 
-                    noise_scale = self._get_noise_scale(param_name)
+                # evaluate
 
-                    noise_config_with_scale[param_name] = (seed, noise_scale)
-
-                # maybe roll out with a fixed seed
-
-                with model.temp_add_noise_(noise_config_with_scale):
-                    fitness = with_seed(maybe_rollout_seed)(rollout_for_fitness)()
+                fitness = get_fitness(negate = False)
 
                 if not self.mirror_sampling:
                     fitnesses.append(fitness)
@@ -500,8 +509,7 @@ class EvoStrategy(Module):
 
                 # handle mirror sampling
 
-                with model.temp_add_noise_(noise_config_with_scale, negate = True):
-                    fitness_mirrored = with_seed(maybe_rollout_seed)(rollout_for_fitness)()
+                fitness_mirrored = get_fitness(negate = True)
 
                 fitnesses.append([fitness, fitness_mirrored])
 
