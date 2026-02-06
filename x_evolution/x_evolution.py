@@ -11,6 +11,7 @@ from torch.nn import Module, ModuleList, Parameter, ParameterList
 from torch.optim import SGD, Adam, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from beartype import beartype
@@ -95,7 +96,8 @@ class EvoStrategy(Module):
         accelerate_kwargs: dict = dict(),
         reject_generation_fitnesses_if: Callable[[Tensor], bool] | None = None,
         vectorized = False,
-        vector_size: int | None = None
+        vector_size: int | None = None,
+        sync_on_init = True
     ):
         super().__init__()
         self.verbose = verbose
@@ -127,12 +129,10 @@ class EvoStrategy(Module):
         self.model = model
         self.noisable_model = Noisable(model, low_rank = noise_low_rank)
 
-        # use prepare and run through environment once to sync params
+        # maybe sync model params and buffers
 
-        wrapped_model = accelerator.prepare(model)
-
-        with torch.no_grad():
-            environment(wrapped_model)
+        if sync_on_init:
+            self.sync_model_params_and_buffers_()
 
         # get param dictionary
 
@@ -253,6 +253,17 @@ class EvoStrategy(Module):
     @property
     def device(self):
         return self.accelerate.device
+
+    @torch.no_grad()
+    def sync_model_params_and_buffers_(self):
+        if not self.accelerate.num_processes > 1:
+            return
+
+        for param in self.model.parameters():
+            dist.broadcast(param, src = 0)
+
+        for buffer in self.model.buffers():
+            dist.broadcast(buffer, src = 0)
 
     def print(self, *args, **kwargs):
         if not self.verbose:
