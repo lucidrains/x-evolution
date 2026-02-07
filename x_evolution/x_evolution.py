@@ -14,6 +14,8 @@ from torch.optim.lr_scheduler import LRScheduler
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from tqdm import tqdm
+
 from beartype import beartype
 from beartype.door import is_bearable
 
@@ -485,7 +487,11 @@ class EvoStrategy(Module):
 
             # now loop through the entire population of noise
 
-            for noise_index, individual_seed in zip(noise_indices, seeds_for_machine):
+            is_main = self.accelerate.is_main_process
+
+            pbar = tqdm(zip(noise_indices, seeds_for_machine), total = len(seeds_for_machine), desc = f'Generation {generation}', disable = not (self.verbose and is_main))
+
+            for noise_index, individual_seed in pbar:
 
                 if noise_index >= pop_size:
                     fitnesses.append([0., 0.] if self.mirror_sampling else 0.)
@@ -516,6 +522,7 @@ class EvoStrategy(Module):
 
                 if not self.mirror_sampling:
                     fitnesses.append(fitness)
+                    pbar.set_postfix(reward = f'{fitness:.3f}')
                     continue
 
                 # handle mirror sampling
@@ -523,6 +530,9 @@ class EvoStrategy(Module):
                 fitness_mirrored = get_fitness(negate = True)
 
                 fitnesses.append([fitness, fitness_mirrored])
+                pbar.set_postfix(reward = f'{(fitness + fitness_mirrored) / 2:.3f}')
+
+            pbar.close()
 
             # normalize the fitness and weighted sum of all the noise is the update
 
