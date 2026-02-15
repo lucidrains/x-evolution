@@ -167,7 +167,7 @@ def main(
     env_id = 'AntMaze_UMazeDense-v5',
     num_generations = 50_000,
     max_steps = 250,
-    noise_population_size = 64,
+    noise_population_size = 150,
     verbose = True
 ):
     # Determine dims from temp env
@@ -197,7 +197,7 @@ def main(
         noise_scale_clamp_range = (5e-3, 2e-2),
         learned_noise_scale = True,
         use_sigma_optimizer = True,
-        learning_rate = 1e-3,
+        learning_rate = 3e-4,
         noise_scale_learning_rate = 1e-4,
         use_scheduler = True,
         scheduler_klass = CosineAnnealingLR,

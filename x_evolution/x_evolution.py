@@ -290,7 +290,7 @@ class EvoStrategy(Module):
         model = self.noisable_model
 
         if isinstance(fitnesses, list):
-            fitnesses = tensor(fitnesses)
+            fitnesses = tensor(fitnesses, dtype = torch.float32)
 
         if isinstance(seeds_for_population, list):
             seeds_for_population = tensor(seeds_for_population)
@@ -536,7 +536,7 @@ class EvoStrategy(Module):
 
             # normalize the fitness and weighted sum of all the noise is the update
 
-            fitnesses = tensor(fitnesses, device = self.device).float()
+            fitnesses = tensor(fitnesses, device = self.device, dtype = torch.float32)
 
             # all gather
 
