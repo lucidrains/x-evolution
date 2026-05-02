@@ -279,7 +279,7 @@ def main(
     use_wandb = True,
     wandb_project = 'lunar-hierarchical-transformer',
     rolling_window = 20,
-    noise_population_size = 50,
+    noise_population_size = 100,
     learning_rate = 1e-3,
     noise_scale = 1e-2
 ):
