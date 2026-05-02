@@ -39,8 +39,7 @@ def parse_string_schedule(schedule_str):
     schedule_str = re.sub(r'\(([^)]+)\)\s*\*\s*(\d+)', lambda m: f" {m.group(1)} " * int(m.group(2)), schedule_str)
 
     phases = []
-    for duration, phase in re.findall(r'(\d+)\s*(all|both|inner|outer)', schedule_str.lower()):
-        phase = 'all' if phase == 'both' else phase
+    for duration, phase in re.findall(r'(\d+)\s*(all|head|trunk|tail)', schedule_str.lower()):
         phases.extend([phase] * int(duration))
 
     assert len(phases) > 0, 'could not parse phase schedule string'
@@ -50,7 +49,9 @@ def parse_string_schedule(schedule_str):
 
 def orthogonal_project(x, residual):
     dtype = residual.dtype
-    residual, x = residual.double(), x.double()
+
+    if x.device.type != 'mps':
+        residual, x = residual.double(), x.double()
 
     unit = F.normalize(residual, dim = -1)
     parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
@@ -59,7 +60,7 @@ def orthogonal_project(x, residual):
     return orthogonal.to(dtype)
 
 # hierarchical transformer
-# outer pre -> inner (residual gated every inner_update_every steps) -> outer post
+# head -> trunk (residual gated every trunk_update_every steps) -> tail
 
 class HierarchicalTransformer(Module):
     def __init__(
@@ -67,14 +68,15 @@ class HierarchicalTransformer(Module):
         dim_in,
         dim,
         num_actions,
-        outer_depth = 1,
-        inner_depth = 1,
-        inner_update_every = 1
+        head_depth = 1,
+        trunk_depth = 1,
+        tail_depth = 1,
+        trunk_update_every = 1
     ):
         super().__init__()
-        self.inner_update_every = inner_update_every
+        self.trunk_update_every = trunk_update_every
 
-        self.inner_update_emb = nn.Parameter(torch.zeros(dim))
+        self.trunk_update_emb = nn.Parameter(torch.zeros(dim))
 
         self.token_emb = nn.Linear(dim_in, dim)
 
@@ -86,58 +88,64 @@ class HierarchicalTransformer(Module):
             pre_norm_has_final_norm = False
         )
 
-        self.outer_pre = Decoder(depth = outer_depth, **decoder_kwargs)
+        self.head = Decoder(depth = head_depth, **decoder_kwargs)
 
-        self.inner = Decoder(depth = inner_depth, **decoder_kwargs)
-        self.inner_gru_norm = nn.RMSNorm(dim)
-        self.inner_gru = nn.GRU(dim, dim, batch_first = True)
+        self.state_to_trunk = nn.Linear(dim_in, dim)
 
-        self.outer_post = Decoder(depth = outer_depth, **decoder_kwargs)
+        self.trunk = Decoder(depth = trunk_depth, **decoder_kwargs)
+        self.trunk_gru_norm = nn.RMSNorm(dim)
+        self.trunk_gru = nn.GRU(dim, dim, batch_first = True)
+
+        self.tail = Decoder(depth = tail_depth, **decoder_kwargs)
 
         self.to_logits = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, num_actions)
         )
 
-    def forward(self, x, step = 0, cache = None):
-        b, n, _ = x.shape
+    def forward(self, state, step = 0, cache = None):
+        b, n, _ = state.shape
         assert n == 1, 'only single token rollouts are supported'
 
-        x = self.token_emb(x)
+        x = self.token_emb(state)
 
-        cache_pre, cache_inner, cache_post, cache_gru, last_inner_update = cache if exists(cache) else (None, None, None, None, None)
+        cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update = cache if exists(cache) else (None, None, None, None, None)
 
-        # outer pre
+        # head
 
-        x, cache_pre = self.outer_pre(x, cache = cache_pre, return_hiddens = True)
+        x, cache_head = self.head(x, cache = cache_head, return_hiddens = True)
 
-        should_update = (step % self.inner_update_every) == 0
+        should_update = (step % self.trunk_update_every) == 0
 
-        # let the inner network know when it is an update step
+        # let the trunk network know when it is an update step
 
-        x_inner = x
-
-        if should_update:
-            x_inner = x_inner + self.inner_update_emb
-
-        # inner - always runs for KV context, but residual only applied every inner_update_every steps
-
-        x_inner, cache_inner = self.inner(x_inner, cache = cache_inner, return_hiddens = True)
-
-        x_inner_gru, cache_gru = self.inner_gru(self.inner_gru_norm(x_inner), cache_gru)
-        x_inner = x_inner + x_inner_gru
+        x_trunk = x
 
         if should_update:
-            last_inner_update = orthogonal_project(x_inner, residual = x)
+            x_trunk = x_trunk + self.trunk_update_emb
 
-        if exists(last_inner_update):
-            x = x + last_inner_update
+        # direct residual from state to trunk
 
-        # outer post
+        x_trunk = x_trunk + self.state_to_trunk(state)
 
-        x, cache_post = self.outer_post(x, cache = cache_post, return_hiddens = True)
+        # trunk - always runs for KV context, but residual only applied every trunk_update_every steps
 
-        return self.to_logits(x), (cache_pre, cache_inner, cache_post, cache_gru, last_inner_update)
+        x_trunk, cache_trunk = self.trunk(x_trunk, cache = cache_trunk, return_hiddens = True)
+
+        x_trunk_gru, cache_gru = self.trunk_gru(self.trunk_gru_norm(x_trunk), cache_gru)
+        x_trunk = x_trunk + x_trunk_gru
+
+        if should_update:
+            last_trunk_update = orthogonal_project(x_trunk, residual = x)
+
+        if exists(last_trunk_update):
+            x = x + last_trunk_update
+
+        # tail
+
+        x, cache_tail = self.tail(x, cache = cache_tail, return_hiddens = True)
+
+        return self.to_logits(x), (cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update)
 
 # environment
 
@@ -247,11 +255,12 @@ def main(
     vectorized = False,
     num_envs = 8,
     cpu = False,
-    phase_schedule = '150all (50inner 50all)*10',
-    inner_update_every = 1,
-    outer_depth = 1,
-    inner_depth = 1,
-    dim = 32,
+    phase_schedule = '200all (50trunk 50tail)*10',
+    trunk_update_every = 1,
+    head_depth = 1,
+    trunk_depth = 1,
+    tail_depth = 1,
+    dim = 64,
     use_wandb = True,
     wandb_project = 'lunar-hierarchical-transformer',
     rolling_window = 20,
@@ -266,9 +275,10 @@ def main(
         dim_in = 8,
         dim = dim,
         num_actions = 4,
-        outer_depth = outer_depth,
-        inner_depth = inner_depth,
-        inner_update_every = inner_update_every
+        head_depth = head_depth,
+        trunk_depth = trunk_depth,
+        tail_depth = tail_depth,
+        trunk_update_every = trunk_update_every
     )
 
     env = LunarEnvironment(
@@ -278,14 +288,22 @@ def main(
         rolling_window = rolling_window
     )
 
-    # partition parameters into inner vs outer
+    # partition parameters into head, trunk, tail
 
-    inner_param_ids = {id(p) for p in model.inner.parameters()} | {id(model.inner_update_emb)} | {id(p) for p in model.inner_gru.parameters()} | {id(p) for p in model.inner_gru_norm.parameters()}
+    head_params = list(model.token_emb.parameters()) + list(model.head.parameters())
+    trunk_params = list(model.state_to_trunk.parameters()) + list(model.trunk.parameters()) + [model.trunk_update_emb] + list(model.trunk_gru.parameters()) + list(model.trunk_gru_norm.parameters())
+    tail_params = list(model.tail.parameters()) + list(model.to_logits.parameters())
 
-    inner_params = [p for p in model.parameters() if id(p) in inner_param_ids]
-    outer_params = [p for p in model.parameters() if id(p) not in inner_param_ids]
+    head_param_ids = {id(p) for p in head_params}
+    trunk_param_ids = {id(p) for p in trunk_params}
+    tail_param_ids = {id(p) for p in tail_params}
+
+    assert len(head_param_ids & trunk_param_ids) == 0, 'head and trunk parameters overlap'
+    assert len(head_param_ids & tail_param_ids) == 0, 'head and tail parameters overlap'
+    assert len(trunk_param_ids & tail_param_ids) == 0, 'trunk and tail parameters overlap'
+
     all_params = list(model.parameters())
-
+    assert len(head_params) + len(trunk_params) + len(tail_params) == len(all_params), 'some parameters are not partitioned'
 
     evo_kwargs = dict(
         environment = env,
@@ -310,8 +328,9 @@ def main(
 
     evos = dict(
         all = EvoStrategy(model, params_to_optimize = all_params, **evo_kwargs),
-        inner = EvoStrategy(model, params_to_optimize = inner_params, **evo_kwargs),
-        outer = EvoStrategy(model, params_to_optimize = outer_params, **evo_kwargs),
+        head = EvoStrategy(model, params_to_optimize = head_params, **evo_kwargs),
+        trunk = EvoStrategy(model, params_to_optimize = trunk_params, **evo_kwargs),
+        tail = EvoStrategy(model, params_to_optimize = tail_params, **evo_kwargs),
     )
 
     # schedule
@@ -323,7 +342,8 @@ def main(
     print('\n--- Training Phase Schedule ---')
     print(f'Schedule: {phase_schedule}')
     print(f'Total Generations: {total_generations}')
-    print(f'Inner updates every: {inner_update_every} steps')
+    print(f'Trunk updates every: {trunk_update_every} steps')
+    print(f'Population Size: {noise_population_size}')
     print('-------------------------------\n')
 
     pbar = tqdm(total = total_generations, desc = 'Generations')
@@ -346,7 +366,8 @@ def main(
         if use_wandb:
             wandb.log(dict(
                 generation = gen,
-                phase = phase,
+                phase_str = phase,
+                phase = {'all': 0, 'head': 1, 'trunk': 2, 'tail': 3}.get(phase, -1),
                 avg_fitness = avg_fit,
                 avg_reward_window = avg_reward,
                 avg_steps = avg_steps,
