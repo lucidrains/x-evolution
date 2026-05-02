@@ -45,7 +45,7 @@ def parse_string_schedule(schedule_str):
     assert len(phases) > 0, 'could not parse phase schedule string'
     return phases
 
-# orthogonal update from inner to outer
+# orthogonal update from trunk to head
 
 def orthogonal_project(x, residual):
     dtype = residual.dtype
