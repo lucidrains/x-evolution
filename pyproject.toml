@@ -65,3 +65,11 @@ allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["x_evolution"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "x_evolution",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
