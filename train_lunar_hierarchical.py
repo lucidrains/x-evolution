@@ -103,13 +103,21 @@ class HierarchicalTransformer(Module):
             nn.Linear(dim, num_actions)
         )
 
+        self.trunk_action_gate = nn.Linear(dim, num_actions)
+
+        self.trunk_to_logits = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_actions)
+        )
+
     def forward(self, state, step = 0, cache = None):
         b, n, _ = state.shape
         assert n == 1, 'only single token rollouts are supported'
 
         x = self.token_emb(state)
 
-        cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update = cache if exists(cache) else (None, None, None, None, None)
+        cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update, last_trunk_action = cache if exists(cache) else (None, None, None, None, None, None)
 
         # head
 
@@ -137,6 +145,7 @@ class HierarchicalTransformer(Module):
 
         if should_update:
             last_trunk_update = orthogonal_project(x_trunk, residual = x)
+            last_trunk_action = self.trunk_to_logits(x_trunk)
 
         if exists(last_trunk_update):
             x = x + last_trunk_update
@@ -145,7 +154,13 @@ class HierarchicalTransformer(Module):
 
         x, cache_tail = self.tail(x, cache = cache_tail, return_hiddens = True)
 
-        return self.to_logits(x), (cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update)
+        logits = self.to_logits(x)
+
+        if exists(last_trunk_action):
+            gate = self.trunk_action_gate(x).sigmoid()
+            logits = logits + gate * last_trunk_action
+
+        return logits, (cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update, last_trunk_action)
 
 # environment
 
@@ -291,8 +306,8 @@ def main(
     # partition parameters into head, trunk, tail
 
     head_params = list(model.token_emb.parameters()) + list(model.head.parameters())
-    trunk_params = list(model.state_to_trunk.parameters()) + list(model.trunk.parameters()) + [model.trunk_update_emb] + list(model.trunk_gru.parameters()) + list(model.trunk_gru_norm.parameters())
-    tail_params = list(model.tail.parameters()) + list(model.to_logits.parameters())
+    trunk_params = list(model.state_to_trunk.parameters()) + list(model.trunk.parameters()) + [model.trunk_update_emb] + list(model.trunk_gru.parameters()) + list(model.trunk_gru_norm.parameters()) + list(model.trunk_to_logits.parameters())
+    tail_params = list(model.tail.parameters()) + list(model.to_logits.parameters()) + list(model.trunk_action_gate.parameters())
 
     head_param_ids = {id(p) for p in head_params}
     trunk_param_ids = {id(p) for p in trunk_params}
