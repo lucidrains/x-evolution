@@ -72,6 +72,8 @@ FITNESS_WEIGHT_FACTORS = dict(
 
 FitnessWeightFactorType = Literal['normalize', 'centered_rank']
 
+ParametersToOptimize = list[str] | Module | list[Module] | list[Parameter]
+
 # class
 
 class EvoStrategy(Module):
@@ -86,7 +88,7 @@ class EvoStrategy(Module):
         noise_population_size = 30,
         learning_rate = 1e-3,
         mirror_sampling = True,
-        params_to_optimize: list[str] | Module | list[Module] | list[Parameter] | None = None,
+        params_to_optimize: dict[str, ParametersToOptimize] | ParametersToOptimize | None = None,
         noise_low_rank: int | None = None,
         rollout_fixed_seed = True,
         noise_scale = 1e-2,  # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
@@ -160,24 +162,31 @@ class EvoStrategy(Module):
         named_parameters_dict = dict(model.named_parameters())
 
         param_to_name_index = {param: name for name, param in named_parameters_dict.items()}
+        self._param_to_name_index = param_to_name_index
 
         param_names = set(named_parameters_dict.keys())
 
         # default to all parameters to optimize with evo strategy
 
+        self.scopes = None
+
+        if isinstance(params_to_optimize, dict):
+            self.scopes = dict()
+            all_scoped_params = set()
+
+            for scope_name, scope_params in params_to_optimize.items():
+                resolved_scope_params = self._resolve_params_to_names(scope_params)
+                assert all([name in param_names for name in resolved_scope_params]), f'some parameters in scope {scope_name} are not found in the model'
+                self.scopes[scope_name] = resolved_scope_params
+                all_scoped_params |= resolved_scope_params
+
+            params_to_optimize = list(all_scoped_params)
+
         params_to_optimize = default(params_to_optimize, param_names)
 
-        # if Modules given, convert to Parameters
-        # then convert Parameters to names
+        # convert to names using the helper method
 
-        if isinstance(params_to_optimize, Module):
-            params_to_optimize = list(params_to_optimize.parameters())
-
-        if is_bearable(params_to_optimize, list[Module]):
-            params_to_optimize = list(ModuleList(params_to_optimize).parameters())
-
-        if is_bearable(params_to_optimize, list[Parameter]):
-            params_to_optimize = [param_to_name_index[param] for param in set(params_to_optimize)]
+        params_to_optimize = list(self._resolve_params_to_names(params_to_optimize))
 
         # validate
 
@@ -291,6 +300,21 @@ class EvoStrategy(Module):
         for buffer in self.model.buffers():
             dist.broadcast(buffer, src = 0)
 
+    def _resolve_params_to_names(
+        self,
+        params: ParametersToOptimize
+    ):
+
+        if isinstance(params, Module):
+            params = list(params.parameters())
+        elif is_bearable(params, list[Module]):
+            params = list(ModuleList(params).parameters())
+
+        if is_bearable(params, list[Parameter]):
+            params = [self._param_to_name_index[param] for param in set(params)]
+
+        return set(params)
+
     def print(self, *args, **kwargs):
         if not self.verbose:
             return
@@ -308,7 +332,8 @@ class EvoStrategy(Module):
     def evolve_(
         self,
         fitnesses: list[float] | Tensor,
-        seeds_for_population: list[int] | Tensor
+        seeds_for_population: list[int] | Tensor,
+        scoped_names: set[str] | None = None
     ):
         use_optimizer = self.use_optimizer
         model = self.noisable_model
@@ -348,6 +373,9 @@ class EvoStrategy(Module):
             # setup noise config
 
             noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
+
+            if exists(scoped_names):
+                noise_config = {k: v for k, v in noise_config.items() if k in scoped_names}
 
             noise_config_with_weight = dict()
 
@@ -427,9 +455,20 @@ class EvoStrategy(Module):
         num_generations = None,
         disable_distributed = False,
         rollback_model_at_end = False,
-        verbose = None
+        verbose = None,
+        scope: str | None = None,
+        params_to_optimize: ParametersToOptimize | None = None
     ):
         verbose = default(verbose, self.verbose)
+
+        scoped_names = None
+
+        if exists(scope):
+            assert exists(self.scopes) and scope in self.scopes, f'scope "{scope}" not found in passed parameter dictionary'
+            scoped_names = self.scopes[scope]
+
+        if exists(params_to_optimize):
+            scoped_names = self._resolve_params_to_names(params_to_optimize)
 
         model = self.noisable_model.to(self.device)
 
@@ -525,6 +564,9 @@ class EvoStrategy(Module):
                     individual_param_seeds = with_seed(individual_seed.item())(randint)(0, MAX_SEED_VALUE, (self.num_params,))
                     noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
 
+                    if exists(scoped_names):
+                        noise_config = {k: v for k, v in noise_config.items() if k in scoped_names}
+
                     noise_config_with_scale = dict()
                     for param_name, seed in noise_config.items():
                         noise_scale = self._get_noise_scale(param_name)
@@ -590,7 +632,7 @@ class EvoStrategy(Module):
 
             # pass fitnesses to evolve function
 
-            self.evolve_(fitnesses, seeds_for_population)
+            self.evolve_(fitnesses, seeds_for_population, scoped_names=scoped_names)
 
             # log
 

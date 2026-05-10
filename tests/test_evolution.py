@@ -71,3 +71,31 @@ def test_evo_strat_vectorized(vector_size):
     )
 
     evo_strat()
+
+def test_scoped_parameters():
+    from x_evolution.x_evolution import EvoStrategy
+    model = MLP(8, 16, 4)
+
+    params_dict = dict(
+        first_layer = list(model.layers[0].parameters()),
+        last_layer = list(model.layers[-1].parameters())
+    )
+
+    evo_strat = EvoStrategy(
+        model,
+        environment = lambda m: 1.0,
+        num_generations = 1,
+        params_to_optimize = params_dict,
+        noise_population_size = 2,
+    )
+
+    evo_strat(scope = 'first_layer', num_generations = 1)
+
+    evo_strat(scope = 'last_layer', num_generations = 1)
+
+    evo_strat(num_generations = 1) # all
+
+    # dynamically pass params_to_optimize in forward
+
+    dynamic_params = list(model.layers[1].parameters())
+    evo_strat(params_to_optimize = dynamic_params, num_generations = 1)

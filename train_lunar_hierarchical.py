@@ -9,6 +9,7 @@
 # ]
 # ///
 
+import os
 import re
 import fire
 from shutil import rmtree
@@ -24,6 +25,9 @@ import torch
 from torch import nn
 from torch.nn import Module
 import torch.nn.functional as F
+import torch.distributed as dist
+
+from accelerate import Accelerator
 
 from x_evolution import EvoStrategy
 from x_transformers import Decoder
@@ -271,7 +275,7 @@ def main(
     num_envs = 8,
     cpu = False,
     phase_schedule = '200all (50trunk 50tail)*10',
-    trunk_update_every = 1,
+    trunk_update_every = 2,
     head_depth = 1,
     trunk_depth = 1,
     tail_depth = 1,
@@ -281,9 +285,15 @@ def main(
     rolling_window = 20,
     noise_population_size = 100,
     learning_rate = 1e-3,
-    noise_scale = 1e-2
+    noise_scale = 1e-2,
+    checkpoint_file = 'warmup_checkpoint.pt',
+    save_checkpoint_at = 150
 ):
-    if use_wandb:
+    accelerator = Accelerator(cpu = cpu)
+    is_main = accelerator.is_main_process
+    log_wandb = use_wandb and is_main
+
+    if log_wandb:
         wandb.init(project = wandb_project, config = locals())
 
     model = HierarchicalTransformer(
@@ -320,6 +330,13 @@ def main(
     all_params = list(model.parameters())
     assert len(head_params) + len(trunk_params) + len(tail_params) == len(all_params), 'some parameters are not partitioned'
 
+    params_dict = dict(
+        all = all_params,
+        head = head_params,
+        trunk = trunk_params,
+        tail = tail_params
+    )
+
     evo_kwargs = dict(
         environment = env,
         vectorized = vectorized,
@@ -336,17 +353,13 @@ def main(
         noise_scale_learning_rate = 1e-4,
         use_scheduler = False,
         verbose = False,
+        accelerator = accelerator,
         sync_on_init = True
     )
 
     print('Setting up EvoStrategy wrappers...')
 
-    evos = dict(
-        all = EvoStrategy(model, params_to_optimize = all_params, **evo_kwargs),
-        head = EvoStrategy(model, params_to_optimize = head_params, **evo_kwargs),
-        trunk = EvoStrategy(model, params_to_optimize = trunk_params, **evo_kwargs),
-        tail = EvoStrategy(model, params_to_optimize = tail_params, **evo_kwargs),
-    )
+    evo = EvoStrategy(model, params_to_optimize = params_dict, **evo_kwargs)
 
     # schedule
 
@@ -361,14 +374,29 @@ def main(
     print(f'Population Size: {noise_population_size}')
     print('-------------------------------\n')
 
+    # checkpointing
+
+    start_gen = 1
+    if os.path.exists(checkpoint_file):
+        if is_main:
+            print(f'Loading warmup checkpoint from {checkpoint_file}...')
+
+        checkpoint = torch.load(checkpoint_file, map_location = 'cpu', weights_only = True)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        start_gen = checkpoint['generation'] + 1
+
+        for _ in range(start_gen - 1):
+            next(phase_gen)
+
     pbar = tqdm(total = total_generations, desc = 'Generations')
+    pbar.update(start_gen - 1)
+
     running_rewards = deque(maxlen = rolling_window)
 
-    for gen in range(1, total_generations + 1):
+    for gen in range(start_gen, total_generations + 1):
         phase = next(phase_gen)
-        evo = evos[phase]
 
-        fitnesses = evo(num_generations = 1, verbose = False)
+        fitnesses = evo(num_generations = 1, scope = phase, verbose = False)
         avg_fit = fitnesses.mean().item()
 
         running_rewards.append(avg_fit)
@@ -378,7 +406,7 @@ def main(
         pbar.set_postfix(phase = phase, avg_reward = round(avg_reward, 2), avg_steps = round(avg_steps, 1))
         pbar.update(1)
 
-        if use_wandb:
+        if log_wandb:
             wandb.log(dict(
                 generation = gen,
                 phase_str = phase,
@@ -388,8 +416,21 @@ def main(
                 avg_steps = avg_steps,
             ))
 
-    if use_wandb:
+        if gen == save_checkpoint_at and is_main:
+            torch.save(dict(
+                model_state_dict = model.state_dict(),
+                generation = gen
+            ), checkpoint_file)
+            print(f'\nSaved warmup checkpoint to {checkpoint_file}')
+
+    if log_wandb:
         wandb.finish()
+
+    # cleanup
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        os._exit(0)
 
 if __name__ == '__main__':
     fire.Fire(main)

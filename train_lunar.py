@@ -18,6 +18,7 @@ import numpy as np
 import gymnasium as gym
 
 import torch
+import torch.distributed as dist
 from torch.nn import Module
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -147,6 +148,12 @@ def main(
     )
 
     evo_strat()
+
+    # cleanup
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
+        os._exit(0)
 
 if __name__ == '__main__':
     fire.Fire(main)
