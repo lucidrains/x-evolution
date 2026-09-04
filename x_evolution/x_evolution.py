@@ -117,6 +117,7 @@ class EvoStrategy(Module):
         accelerate_kwargs: dict = dict(),
         reject_generation_fitnesses_if: Callable[[Tensor], bool] | None = None,
         on_result: Callable | None = None,
+        on_generation: Callable | None = None,
         vectorized = False,
         vector_size: int | None = None,
         sync_on_init = True
@@ -127,6 +128,7 @@ class EvoStrategy(Module):
         self.vectorized = vectorized
         self.vector_size = vector_size
         self.on_result = on_result
+        self.on_generation = on_generation
 
         if not exists(accelerator):
             accelerator = Accelerator(cpu = cpu, **accelerate_kwargs)
@@ -138,11 +140,12 @@ class EvoStrategy(Module):
         self.environment = environment
 
         if accelerator.is_main_process:
-            if hasattr(environment, 'pre_main_callback') and callable(environment.pre_main_callback):
+            pre_main_callback = getattr(environment, 'pre_main_callback', None)
+            if callable(pre_main_callback):
                 self.print('pre_main_callback detected on environment passed in and is invoked')
-                environment.pre_main_callback()
+                pre_main_callback()
 
-        accelerator.wait_for_everyone()
+        self.wait_for_everyone()
 
         # take care of model and parameters
 
@@ -289,9 +292,19 @@ class EvoStrategy(Module):
     def device(self):
         return self.accelerate.device
 
+    @property
+    def is_distributed(self):
+        return self.accelerate.num_processes > 1
+
+    def wait_for_everyone(self):
+        if not (self.is_distributed and dist.is_available() and dist.is_initialized()):
+            return
+
+        dist.barrier()
+
     @torch.no_grad()
     def sync_model_params_and_buffers_(self):
-        if not self.accelerate.num_processes > 1:
+        if not (self.is_distributed and dist.is_available() and dist.is_initialized()):
             return
 
         for param in self.model.parameters():
@@ -446,7 +459,7 @@ class EvoStrategy(Module):
             filepath = self.checkpoint_folder / f'{filename}.pt'
             torch.save(self.model.state_dict(), str(filepath))
 
-        self.accelerate.wait_for_everyone()
+        self.wait_for_everyone()
 
     @torch.inference_mode()
     def forward(
@@ -532,17 +545,6 @@ class EvoStrategy(Module):
             seeds_for_machine = seeds_for_population.chunk(world_size)[rank]
 
             fitnesses = []
-
-            # function for fitness
-
-            def rollout_for_fitness():
-                fitness = self.environment(model)
-
-                if is_tensor(fitness):
-                    assert fitness.numel() == 1
-                    fitness = fitness.item()
-
-                return fitness
 
             # seeds
 
@@ -634,6 +636,11 @@ class EvoStrategy(Module):
 
             self.evolve_(fitnesses, seeds_for_population, scoped_names=scoped_names)
 
+            # on generation callback
+
+            if exists(self.on_generation) and self.accelerate.is_main_process:
+                self.on_generation(generation, fitnesses, self.model)
+
             # log
 
             msg = f'[{generation}] average fitness: {fitnesses.mean():.3f} | fitness std: {fitnesses.std():.3f}'
@@ -651,7 +658,7 @@ class EvoStrategy(Module):
                 exists(self.checkpoint_every) and
                 divisible_by(generation, self.checkpoint_every)
             ):
-                self.checkpoint(f'{filename}.{generation}.pt')
+                self.checkpoint(f'{filename}.{generation}')
 
             # increment generation
 
@@ -672,5 +679,8 @@ class EvoStrategy(Module):
 
         # return fitnesses across generations
         # for meta-evolutionary (nesting EvoStrategy within the environment of another and optimizing some meta-network)
+
+        if len(fitnesses_across_generations) == 0:
+            return tensor([], device = self.device)
 
         return stack(fitnesses_across_generations)

@@ -1,5 +1,8 @@
 recordings/
 recordings_humanoid/
+microduck_rl/
+checkpoints-microduck/
+videos/
 
 .DS_Store
 

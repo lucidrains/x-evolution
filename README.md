@@ -71,6 +71,28 @@ For a quick demo on LunarLander with 8 processes
 $ uv run torchrun --nproc_per_node=8 train_lunar.py --cpu True --noise_population_size 100 --fitness_to_weighted_factor centered_rank
 ```
 
+## Sim-to-Real Bipedal Locomotion (Microduck)
+
+You can train a walking gait for the [Microduck](https://github.com/pollen-robotics/reachy2_microduck) biped robot from scratch using `EvoStrategy` and `torchrun`.
+
+With a population size of 128 distributed across 8 CPU processes, a forward walking gait emerges around **150 generations** (~3-4 minutes):
+
+```shell
+$ uv run torchrun --nproc_per_node=8 train_microduck.py
+```
+
+To render evaluation videos or resume from the saved best checkpoint:
+
+```shell
+# render periodic evaluation videos to videos/
+$ uv run torchrun --nproc_per_node=8 train_microduck.py --eval_video True --eval_every 50
+
+# resume training from best checkpoint
+$ uv run torchrun --nproc_per_node=8 train_microduck.py --resume True
+```
+
+Special thanks to [Pollen Robotics 🤗](https://www.pollen-robotics.com/) for their open sourcing of such a polished sim2real env!
+
 ## Citations
 
 ```bibtex
