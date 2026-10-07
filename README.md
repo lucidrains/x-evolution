@@ -140,4 +140,13 @@ Special thanks to [Pollen Robotics 🤗](https://www.pollen-robotics.com/) for t
 }
 ```
 
+```bibtex
+@misc{dahal2026backprop,
+    title  = {Dust: Pretraining Transformers Without Backpropagation},
+    author = {Dahal, Samip and Mandal, Bishwas and G{\"u}lbahar, Serdar and Vegesna, Akshay},
+    year   = {2026},
+    url    = {https://qlabs.sh/research/dust}
+}
+```
+
 *Nothing makes sense except in the light of evolution* - Theodosius Dobzhansky

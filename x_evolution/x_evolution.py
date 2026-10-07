@@ -1,5 +1,6 @@
 from __future__ import annotations
-from typing import Callable, Literal
+from typing import Literal, Any
+from collections.abc import Callable
 
 from math import ceil
 from pathlib import Path
@@ -83,7 +84,7 @@ class EvoStrategy(Module):
         self,
         model: Module | list[Module],
         *,
-        environment: Callable[[Module], float | int | Tensor],  # the environment is simply a function that takes in the model and returns a fitness score
+        environment: Callable[[Module], Any] | dict[str, Callable[[Module], Any]],  # reward function, or one per scope
         num_generations,
         noise_population_size = 30,
         learning_rate = 1e-3,
@@ -135,15 +136,20 @@ class EvoStrategy(Module):
 
         self.accelerate = accelerator
 
-        # environment - with optional init
+        # environment - a single reward function, or a dict of one per scope
+        # a single environment can also return one reward per scope, as a dict, tuple, or list
 
         self.environment = environment
+        self.environments = environment if isinstance(environment, dict) else None
+
+        environments = list(self.environments.values()) if exists(self.environments) else [environment]
 
         if accelerator.is_main_process:
-            pre_main_callback = getattr(environment, 'pre_main_callback', None)
-            if callable(pre_main_callback):
-                self.print('pre_main_callback detected on environment passed in and is invoked')
-                pre_main_callback()
+            for one_environment in environments:
+                pre_main_callback = getattr(one_environment, 'pre_main_callback', None)
+                if callable(pre_main_callback):
+                    self.print('pre_main_callback detected on environment passed in and is invoked')
+                    pre_main_callback()
 
         self.wait_for_everyone()
 
@@ -172,6 +178,7 @@ class EvoStrategy(Module):
         # default to all parameters to optimize with evo strategy
 
         self.scopes = None
+        self.scope_names = None
 
         if isinstance(params_to_optimize, dict):
             self.scopes = dict()
@@ -179,11 +186,18 @@ class EvoStrategy(Module):
 
             for scope_name, scope_params in params_to_optimize.items():
                 resolved_scope_params = self._resolve_params_to_names(scope_params)
-                assert all([name in param_names for name in resolved_scope_params]), f'some parameters in scope {scope_name} are not found in the model'
+                assert all(name in param_names for name in resolved_scope_params), f'some parameters in scope {scope_name} are not found in the model'
                 self.scopes[scope_name] = resolved_scope_params
                 all_scoped_params |= resolved_scope_params
 
+            self.scope_names = list(self.scopes)
             params_to_optimize = list(all_scoped_params)
+
+        # a dict of environments gives one reward function per scope, so the keys must line up with the scopes
+
+        if exists(self.environments):
+            assert exists(self.scopes), 'when environment is a dict, params_to_optimize must also be a dict with the same scope names'
+            assert set(self.environments) == set(self.scopes), f'environment keys {list(self.environments)} must match scope names {list(self.scopes)}'
 
         params_to_optimize = default(params_to_optimize, param_names)
 
@@ -341,6 +355,34 @@ class EvoStrategy(Module):
         sigma_index = self.param_name_to_sigma_index[param_name]
         return self.sigmas[sigma_index]
 
+    @staticmethod
+    def _to_float(reward):
+        if isinstance(reward, Tensor):
+            return reward.mean().item()
+
+        return float(reward)
+
+    def _resolve_rewards(self, rewards, scope):
+        # a reward is a scalar, or one reward per scope as a dict, tuple, or list
+        # resolves to a float, or to a list of floats in scope order, with a scope picking out its own reward
+
+        if isinstance(rewards, (dict, list, tuple)):
+            assert exists(self.scope_names), 'environment returned one reward per scope, but no scopes were defined in params_to_optimize'
+
+            if isinstance(rewards, dict):
+                assert set(rewards) == set(self.scope_names), f'reward keys {list(rewards)} must match scope names {self.scope_names}'
+                rewards = [rewards[name] for name in self.scope_names]
+            else:
+                assert len(rewards) == len(self.scope_names), f'environment returned {len(rewards)} rewards, expected one per scope {self.scope_names}'
+                rewards = list(rewards)
+        else:
+            return self._to_float(rewards)
+
+        if exists(scope):
+            return self._to_float(rewards[self.scope_names.index(scope)])
+
+        return [self._to_float(reward) for reward in rewards]
+
     @torch.inference_mode()
     def evolve_(
         self,
@@ -474,6 +516,11 @@ class EvoStrategy(Module):
     ):
         verbose = default(verbose, self.verbose)
 
+        # a scope restricts the population and the update to that scope's parameters and reward, for interleaving scopes phase by phase
+        # otherwise a joint population is rolled out, each scope updated with its own reward when one is returned per scope
+
+        dynamic_params = exists(params_to_optimize)
+
         scoped_names = None
 
         if exists(scope):
@@ -493,7 +540,7 @@ class EvoStrategy(Module):
         # maybe sigmas
 
         if self.learned_noise_scale:
-             self.sigmas = self.sigmas.to(self.device)
+            self.sigmas = self.sigmas.to(self.device)
 
         # get world size, rank, and determine if distributed
 
@@ -545,6 +592,7 @@ class EvoStrategy(Module):
             seeds_for_machine = seeds_for_population.chunk(world_size)[rank]
 
             fitnesses = []
+            rewards_by_scope = False
 
             # seeds
 
@@ -559,28 +607,38 @@ class EvoStrategy(Module):
             for noise_index, individual_seed in pbar:
 
                 if noise_index >= pop_size:
-                    fitnesses.append([0., 0.] if self.mirror_sampling else 0.)
+                    fitnesses.append(None)
                     continue
 
                 def get_fitness(negate = False):
+                    nonlocal rewards_by_scope
+
                     individual_param_seeds = with_seed(individual_seed.item())(randint)(0, MAX_SEED_VALUE, (self.num_params,))
                     noise_config = dict(zip(self.param_names_to_optimize, individual_param_seeds.tolist()))
 
                     if exists(scoped_names):
                         noise_config = {k: v for k, v in noise_config.items() if k in scoped_names}
 
-                    noise_config_with_scale = dict()
-                    for param_name, seed in noise_config.items():
-                        noise_scale = self._get_noise_scale(param_name)
-                        noise_config_with_scale[param_name] = (seed, noise_scale)
+                    noise_config_with_scale = {name: (seed, self._get_noise_scale(name)) for name, seed in noise_config.items()}
 
                     with model.temp_add_noise_(noise_config_with_scale, negate = negate):
-                        fitness = with_seed(maybe_rollout_seed)(self.environment)(model)
 
-                    if isinstance(fitness, Tensor) and fitness.numel() > 1:
-                        fitness = fitness.mean().item()
-                    elif isinstance(fitness, Tensor):
-                        fitness = fitness.item()
+                        # a dict of environments gives one reward function per scope
+                        # otherwise the single environment is called once, returning a scalar, or one reward per scope
+
+                        rollout = with_seed(maybe_rollout_seed)
+
+                        if exists(self.environments) and not exists(scope):
+                            fitness = [rollout(self.environments[name])(model) for name in self.scope_names]
+                        else:
+                            env = self.environments[scope] if exists(scope) and exists(self.environments) else self.environment
+                            fitness = rollout(env)(model)
+
+                        fitness = self._resolve_rewards(fitness, scope)
+
+                    if isinstance(fitness, list):
+                        assert not dynamic_params, 'per-scope rewards were returned, so pass `scope = ...` instead of `params_to_optimize = ...`'
+                        rewards_by_scope = True
 
                     return fitness
 
@@ -601,12 +659,29 @@ class EvoStrategy(Module):
                 fitness_mirrored = get_fitness(negate = True)
 
                 fitnesses.append([fitness, fitness_mirrored])
-                avg_fitness = (fitness + fitness_mirrored) / 2
+
+                if isinstance(fitness, list):
+                    avg_fitness = [(pos + neg) / 2 for pos, neg in zip(fitness, fitness_mirrored)]
+                else:
+                    avg_fitness = (fitness + fitness_mirrored) / 2
 
                 if exists(self.on_result):
                     self.on_result(avg_fitness, pbar)
 
             pbar.close()
+
+            # whether rewards are per scope is discovered from the rollouts, and needs to be agreed on across machines
+
+            if is_distributed:
+                flag = tensor(float(rewards_by_scope), device = self.device)
+                rewards_by_scope = self.accelerate.reduce(flag, reduction = 'sum').item() > 0
+
+            # pad the population to a multiple of the world size
+
+            zero = [0.] * len(self.scope_names) if rewards_by_scope else 0.
+            padding = [zero, zero] if self.mirror_sampling else zero
+
+            fitnesses = [default(entry, padding) for entry in fitnesses]
 
             # normalize the fitness and weighted sum of all the noise is the update
 
@@ -632,9 +707,13 @@ class EvoStrategy(Module):
                 self.print(f'[{generation}] fitnesses rejected')
                 continue
 
-            # pass fitnesses to evolve function
+            # one joint population - with per-scope rewards, each scope is updated with its own column
 
-            self.evolve_(fitnesses, seeds_for_population, scoped_names=scoped_names)
+            if rewards_by_scope:
+                for name, scope_fitnesses in zip(self.scope_names, fitnesses.unbind(dim = -1)):
+                    self.evolve_(scope_fitnesses, seeds_for_population, scoped_names = self.scopes[name])
+            else:
+                self.evolve_(fitnesses, seeds_for_population, scoped_names = scoped_names)
 
             # on generation callback
 
@@ -643,7 +722,15 @@ class EvoStrategy(Module):
 
             # log
 
-            msg = f'[{generation}] average fitness: {fitnesses.mean():.3f} | fitness std: {fitnesses.std():.3f}'
+            if rewards_by_scope:
+                fitness_msg = ' | '.join(
+                    f'{name}: {scope_fitnesses.mean():.3f}'
+                    for name, scope_fitnesses in zip(self.scope_names, fitnesses.unbind(dim = -1))
+                )
+            else:
+                fitness_msg = f'{fitnesses.mean():.3f} | fitness std: {fitnesses.std():.3f}'
+
+            msg = f'[{generation}] average fitness: {fitness_msg}'
 
             if self.learned_noise_scale:
                 packed_sigma, _ = pack(list(self.sigmas), '*')
