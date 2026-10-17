@@ -18,7 +18,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+
 os.environ.setdefault('ACCELERATE_USE_CPU', '1')
 
 import shutil
@@ -43,6 +45,50 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def parse_command(command):
+    if not exists(command):
+        return None
+
+    if isinstance(command, str):
+        command = [part for part in command.replace(' ', '').split(',') if part]
+
+    return tuple(float(x) for x in command)
+
+# central pattern generator
+
+def to_phase(x):
+    return torch.tensor(x, dtype = torch.float64) if isinstance(x, (int, float)) else torch.as_tensor(x)
+
+class CPG:
+    """Phase clock plus a sine-basis waveform."""
+
+    def __init__(self, freq = 2.0, dt = 0.02):
+        self.freq, self.dt = freq, dt
+
+    def waveform(self, phi, amp, phase = 0.0, rectify = False, bias = 0.0):
+        # phi (...,) + phase (..., dim) -> (..., dim)
+        phi = to_phase(phi)
+        amp, phase, bias = (torch.as_tensor(x, dtype = phi.dtype, device = phi.device) for x in (amp, phase, bias))
+        rectify = torch.as_tensor(rectify).to(device = phi.device)
+
+        s = torch.sin(phi[..., None] + phase)
+        s = torch.where(rectify, s.clamp(min = 0.0), s)
+
+        return bias + amp * s
+
+    def advance(self, phi, freq = None):
+        return (to_phase(phi) + 2.0 * math.pi * default(freq, self.freq) * self.dt) % (2.0 * math.pi)
+
+def microduck_leg_waveform(clock, phi, cpg_action, swing, knee_lag):
+    # slots -> left hip, left knee, right hip, right knee
+    knee_scale = 1.0 + float(np.clip(cpg_action[1], -1.0, 1.0))
+    phase_l, phase_r = cpg_action[2] * np.pi, cpg_action[3] * np.pi
+
+    amp = np.array([swing, swing * knee_scale, swing, swing * knee_scale])
+    phase = np.array([phase_l, phase_l - knee_lag, phase_r, phase_r - knee_lag])
+
+    return clock.waveform(phi, amp, phase).numpy()
 
 # ensure microduck_rl repository is cloned
 
@@ -72,10 +118,9 @@ class MicroduckGaitEnv:
         kv: float = 0.1,
         horizon: int = 400,
         seed: int = 0,
-        cpg: bool = True,
-        zmp: bool = False,
-        forced_swing: float | None = 0.25,
+        forced_swing: float | None = None,
         command: tuple[float, float] | None = (0.15, 0.0),
+        command_scale: float = 5.0,
         control_hz: int = 50,
         n_substeps: int = 5,
         action_scale: float = 0.5,
@@ -85,7 +130,8 @@ class MicroduckGaitEnv:
         cpg_knee_lag: float = np.pi / 2,
         track_weight: float = 2.0,
         track_std: tuple[float, float] = (0.02, 0.15),
-        progress_weight: float = 5.0,
+        progress_weight: float = 20.0,
+        distance_weight: float = 10.0,
         upright_weight: float = 2.0,
         upright_std: float = 0.05,
         pose_weight: float = 1.0,
@@ -105,9 +151,6 @@ class MicroduckGaitEnv:
         foot_clearance_weight: float = -0.5,
         foot_clearance_target: float = 0.02,
         self_collision_weight: float = -1.0,
-        zmp_weight: float = 2.0,
-        zmp_std: float = 0.05,
-        zmp_ema: float = 0.7,
         min_trunk_z: float = 0.06,
         min_uprightness: float = 0.5,
         standing_trunk_z: float = 0.095,
@@ -116,24 +159,31 @@ class MicroduckGaitEnv:
         reset_z_range: tuple[float, float] = (0.0, 0.01),
         reset_joint_noise: float = 0.05,
         reset_vel_noise: float = 0.1,
+        lin_vel_range: tuple[float, float] = (-0.2, 0.2),
+        ang_vel_range: tuple[float, float] = (-0.4, 0.4),
     ):
         mjcf_path = default(mjcf_path, ensure_microduck_repo)
         if callable(mjcf_path):
             mjcf_path = mjcf_path()
 
+        self.mjcf_path = Path(mjcf_path)
         self.control_hz = control_hz
         self.n_substeps = n_substeps
         self.physics_dt = 1.0 / (control_hz * n_substeps)
+        self.control_dt = 1.0 / control_hz
         self.action_scale = action_scale
         self.policy_range = policy_range
 
         self.cpg_freq = cpg_freq
         self.cpg_swing_max = cpg_swing_max
         self.cpg_knee_lag = cpg_knee_lag
+        self.cpg_clock = CPG(freq = cpg_freq, dt = self.control_dt)
+        self.cpg_phi = 0.0
 
         self.track_weight = track_weight
         self.track_std = track_std
         self.progress_weight = progress_weight
+        self.distance_weight = distance_weight
         self.upright_weight = upright_weight
         self.upright_std = upright_std
         self.pose_weight = pose_weight
@@ -157,10 +207,6 @@ class MicroduckGaitEnv:
         self.foot_clearance_target = foot_clearance_target
         self.self_collision_weight = self_collision_weight
 
-        self.zmp_weight = zmp_weight
-        self.zmp_std = zmp_std
-        self.zmp_ema = zmp_ema
-
         self.min_trunk_z = min_trunk_z
         self.min_uprightness = min_uprightness
         self.standing_trunk_z = standing_trunk_z
@@ -169,6 +215,8 @@ class MicroduckGaitEnv:
         self.reset_z_range = reset_z_range
         self.reset_joint_noise = reset_joint_noise
         self.reset_vel_noise = reset_vel_noise
+        self.lin_vel_range = lin_vel_range
+        self.ang_vel_range = ang_vel_range
 
         self.model = mujoco.MjModel.from_xml_path(str(mjcf_path))
         self.model.opt.timestep = self.physics_dt
@@ -185,10 +233,10 @@ class MicroduckGaitEnv:
         self.horizon = horizon
         self.action_dim = self.model.nu
         self.obs_dim = 3 + 3 + 3 * self.action_dim + 2
-        self.cpg = cpg
-        self.zmp = zmp
         self.forced_swing = forced_swing
+        command = parse_command(command)
         self.fixed_command = np.asarray(command, dtype = np.float64) if exists(command) else None
+        self.command_scale = command_scale
 
         self.rng = np.random.default_rng(seed)
         self.last_action = np.zeros(self.action_dim)
@@ -196,7 +244,6 @@ class MicroduckGaitEnv:
         self.steps = 0
         self.episodes = 0
         self.foot_air = np.zeros(2)
-        self.cop = np.zeros(2)
 
         self.trunk_body = 1
         self.world_up = np.array([0.0, 0.0, 1.0])
@@ -208,8 +255,9 @@ class MicroduckGaitEnv:
         self.foot_bodies = np.array([self.model.geom_bodyid[g] for g in self.foot_geoms])
         self.non_foot_bodies = np.array([i for i in range(self.model.nbody) if i not in self.foot_bodies and i != 0])
 
-        joint_id = lambda name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name) - 1
-        self.cpg_ctrl = np.array([joint_id(n) for n in ('left_hip_pitch', 'left_knee', 'right_hip_pitch', 'right_knee')])
+        actuator_id = lambda name: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name)
+        self.cpg_action_dim = 4
+        self.cpg_ctrl = np.array([actuator_id(n) for n in ('left_hip_pitch', 'left_knee', 'right_hip_pitch', 'right_knee')])
         self.direct_ctrl = np.setdiff1d(np.arange(self.action_dim), self.cpg_ctrl)
 
         self.pose_stds = np.array([
@@ -230,7 +278,7 @@ class MicroduckGaitEnv:
                 np.zeros(6),
                 np.zeros(self.action_dim * 2),
                 self.last_action,
-                self.command,
+                self.command * self.command_scale,
             ]).astype(np.float32)
 
         g = -self.data.xmat[self.trunk_body].reshape(3, 3).T @ self.world_up
@@ -241,7 +289,7 @@ class MicroduckGaitEnv:
             self.data.qpos[7:] - self.home_qpos[7:],
             self.data.qvel[6:],
             self.last_action,
-            self.command,
+            self.command * self.command_scale,
         ]).astype(np.float32)
 
     def reset(
@@ -265,12 +313,15 @@ class MicroduckGaitEnv:
         elif self.rng.uniform() < 0.25:
             self.command = np.zeros(2, dtype = np.float32)
         else:
-            self.command = np.array([self.rng.uniform(-0.3, 0.3), self.rng.uniform(-0.5, 0.5)], dtype = np.float32)
+            self.command = np.array([
+                self.rng.uniform(*self.lin_vel_range),
+                self.rng.uniform(*self.ang_vel_range)
+            ], dtype = np.float32)
 
         self.last_action[:] = 0.
         self.steps = 0
+        self.cpg_phi = 0.0
         self.foot_air[:] = 0
-        self.cop[:] = 0
         self.episodes += 1
 
         return self.observe()
@@ -282,28 +333,21 @@ class MicroduckGaitEnv:
 
         # compute control targets
 
-        if self.cpg:
-            cpg, direct = action[:4], action[4:]
-            t = self.steps * (self.physics_dt * self.n_substeps)
+        cpg_action, direct = action[:self.cpg_action_dim], action[self.cpg_action_dim:]
 
-            swing_l = swing_r = default(
-                self.forced_swing,
-                np.clip(cpg[0], 0.0, 1.0) * self.cpg_swing_max
-            )
+        # action[0] modulates swing around the nominal half-amplitude
+        swing = default(
+            self.forced_swing,
+            0.5 * self.cpg_swing_max * (1.0 + np.clip(cpg_action[0], -1.0, 1.0))
+        )
 
-            phi_l, phi_r = cpg[2] * np.pi, cpg[3] * np.pi
+        ctrl = self.home_ctrl.copy()
+        ctrl[self.cpg_ctrl] += microduck_leg_waveform(
+            self.cpg_clock, self.cpg_phi, cpg_action, swing, self.cpg_knee_lag
+        )
+        ctrl[self.direct_ctrl] += self.action_scale * np.clip(direct, *self.policy_range)
 
-            hip_l = swing_l * np.sin(2 * np.pi * self.cpg_freq * t + phi_l)
-            knee_l = swing_l * np.sin(2 * np.pi * self.cpg_freq * t + phi_l - self.cpg_knee_lag)
-            hip_r = swing_r * np.sin(2 * np.pi * self.cpg_freq * t + phi_r)
-            knee_r = swing_r * np.sin(2 * np.pi * self.cpg_freq * t + phi_r - self.cpg_knee_lag)
-
-            ctrl = self.home_ctrl.copy()
-            ctrl[self.cpg_ctrl] += [hip_l, knee_l, hip_r, knee_r]
-            ctrl[self.direct_ctrl] += self.action_scale * np.clip(direct, *self.policy_range)
-        else:
-            ctrl = self.home_ctrl + self.action_scale * action_eff
-
+        self.cpg_phi = float(self.cpg_clock.advance(self.cpg_phi))
         self.data.ctrl[:] = ctrl
 
         for _ in range(self.n_substeps):
@@ -368,7 +412,7 @@ class MicroduckGaitEnv:
                 else:
                     self.foot_air[i] += 1
 
-            air_time = self.foot_air * (self.physics_dt * self.n_substeps)
+            air_time = self.foot_air * self.control_dt
             ramp = min(1.0, self.episodes / self.air_time_ramp_episodes)
             reward += self.air_time_weight * ramp * ((air_time > self.air_time_min) & (air_time < self.air_time_max)).sum()
         else:
@@ -402,33 +446,10 @@ class MicroduckGaitEnv:
 
             reward += self.foot_slip_weight * slip + self.foot_clearance_weight * np.clip((self.foot_clearance_target - foot_z) / self.foot_clearance_target, 0., 1.).mean()
 
-        if self.zmp:
-            normals, positions = [], []
-            for i in range(self.data.ncon):
-                c = self.data.contact[i]
-                if 0 not in (int(c.geom1), int(c.geom2)) or c.efc_address < 0:
-                    continue
-                normal = c.frame[0:3]
-                if abs(normal[2]) < 0.5:
-                    continue
-                fn = self.data.efc_force[c.efc_address]
-                if fn <= 0:
-                    continue
-                normals.append(fn)
-                positions.append(c.pos[:2])
-
-            if len(normals) > 0:
-                cop = np.sum(np.stack(positions) * np.array(normals)[:, None], axis = 0) / sum(normals)
-                self.cop = self.zmp_ema * self.cop + (1 - self.zmp_ema) * cop
-
-            support_center = self.data.geom_xpos[self.foot_geoms][:, :2].mean(axis = 0)
-            cop_error = np.linalg.norm(self.cop - support_center)
-            reward += self.zmp_weight * np.exp(-(cop_error ** 2) / self.zmp_std ** 2)
+        if truncated and abs(self.command[0]) > 0.01:
+            reward += self.distance_weight * float(self.data.qpos[0]) * np.sign(self.command[0])
 
         return self.observe(), float(reward), terminated, truncated, {}
-
-    def seed(self, seed: int):
-        self.rng = np.random.default_rng(seed)
 
     def close(self):
         pass
@@ -440,11 +461,13 @@ def evaluate_gait(
     policy,
     seeds: tuple[int, ...] = (0, 1, 2),
     horizon: int = 400,
-    forced_swing: float = 0.25,
+    forced_swing: float | None = None,
     command: tuple[float, float] = (0.15, 0.0),
+    command_scale: float = 5.0,
     kp_mult: float = 3.0,
     mjcf_path: str | Path | None = None,
 ):
+    was_training = policy.training
     policy.eval()
     outs = []
 
@@ -455,62 +478,75 @@ def evaluate_gait(
             horizon = horizon,
             seed = seed,
             command = command,
+            command_scale = command_scale,
             forced_swing = forced_swing
         )
         obs = env.reset(seed = seed, command = command)
-        foot_rest_z = env.data.geom_xpos[env.foot_geoms][:, 2].copy()
-        air = np.zeros(2)
-        segs, peaks = [], []
-        peak = np.zeros(2)
         total, steps = 0.0, 0
 
         for _ in range(horizon):
             obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
             action = policy(obs_tensor)
-            if isinstance(action, tuple):
-                action = action[0]
             action_np = action.squeeze(0).cpu().numpy()
 
             obs, reward, term, trunc, _ = env.step(action_np)
             total += float(reward)
             steps += 1
 
-            contacted = np.zeros(2, dtype = bool)
-            for i in range(env.data.ncon):
-                g1, g2 = int(env.data.contact[i].geom1), int(env.data.contact[i].geom2)
-                for j, g in enumerate(env.foot_geoms):
-                    if g1 == g or g2 == g:
-                        contacted[j] = True
-
-            foot_z = env.data.geom_xpos[env.foot_geoms][:, 2]
-
-            for j in range(2):
-                if contacted[j]:
-                    if air[j] > 0.04:
-                        segs.append(float(air[j]))
-                        peaks.append(float(peak[j]))
-                    air[j] = 0.0
-                    peak[j] = 0.0
-                else:
-                    air[j] += env.physics_dt * env.n_substeps
-                    peak[j] = max(peak[j], foot_z[j] - foot_rest_z[j])
-
             if term or trunc:
                 break
 
-        x = float(env.data.qpos[0])
-        outs.append((
-            steps,
-            x,
-            total,
-            float(np.mean(segs)) if segs else 0.0,
-            float(np.max(peaks)) * 100 if peaks else 0.0,
-            len(segs)
-        ))
+        outs.append((steps, float(env.data.qpos[0]), total))
         env.close()
 
-    policy.train()
-    return tuple(float(np.mean([o[i] for o in outs])) for i in range(6))
+    policy.train(was_training)
+    return tuple(float(np.mean([o[i] for o in outs])) for i in range(3))
+
+def add_box(scene, pos, mat, half, rgba):
+    geom = scene.geoms[scene.ngeom]
+    mujoco.mjv_initGeom(geom, mujoco.mjtGeom.mjGEOM_BOX, half, pos, mat.reshape(-1), rgba)
+    geom.emission = 1.0
+    scene.ngeom += 1
+
+def add_command_arrow(scene, env, command):
+    command = parse_command(command) if exists(command) else tuple(env.command)
+    vx, wz = command
+
+    if abs(vx) < 0.01 and abs(wz) < 0.01:
+        return
+
+    head_body = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, 'neck_pitch')
+    head_body = head_body if head_body >= 0 else env.trunk_body
+
+    w, x, y, z = env.data.qpos[3:7]
+    yaw = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+
+    if abs(vx) > 0.01:
+        theta = yaw + (0.0 if vx > 0 else math.pi) + wz * 0.8
+    else:
+        theta = yaw + (math.pi / 2 if wz > 0 else -math.pi / 2)
+
+    direction = np.array([math.cos(theta), math.sin(theta), 0.0])
+    side = np.array([-math.sin(theta), math.cos(theta), 0.0])
+    up = np.array([0.0, 0.0, 1.0])
+    mat = np.stack([direction, side, up], axis = 1)
+
+    length, width, head_len, head_w = 0.10, 0.008, 0.045, 0.010
+    base = env.data.xpos[head_body] + np.array([0.0, 0.0, 0.12])
+    tip = base + direction * length
+    rgba = np.array([1.0, 0.82, 0.2, 0.95], np.float32)
+
+    add_box(scene, base + direction * (length / 2), mat, np.array([length / 2, width, width]), rgba)
+
+    for sign in (-1.0, 1.0):
+        head_theta = theta + sign * math.pi / 4
+        head_dir = np.array([math.cos(head_theta), math.sin(head_theta), 0.0])
+        head_side = np.array([-math.sin(head_theta), math.cos(head_theta), 0.0])
+        head_mat = np.stack([head_dir, head_side, up], axis = 1)
+        add_box(
+            scene, tip - head_dir * (head_len / 2), head_mat,
+            np.array([head_len / 2, head_w, head_w]), rgba
+        )
 
 @torch.no_grad()
 def render_gait(
@@ -519,12 +555,12 @@ def render_gait(
     *,
     kp_mult: float = 3.0,
     kv: float = 0.1,
-    cpg: bool = True,
-    zmp: bool = False,
     horizon: int = 400,
     out_path: str = 'videos/microduck_gait.mp4',
-    forced_swing: float | None = 0.25,
+    forced_swing: float | None = None,
     command: tuple[float, float] = (0.15, 0.0),
+    command_scale: float = 5.0,
+    show_command_arrow: bool = True,
     camera_lookat: tuple[float, float, float] = (0.3, 0.0, 0.15),
     camera_distance: float = 1.0,
     camera_azimuth: float = 150.0,
@@ -538,10 +574,9 @@ def render_gait(
         kp_mult = kp_mult,
         kv = kv,
         horizon = horizon,
-        cpg = cpg,
-        zmp = zmp,
         seed = seed,
         command = command,
+        command_scale = command_scale,
         forced_swing = forced_swing,
         control_hz = control_hz,
     )
@@ -559,13 +594,15 @@ def render_gait(
     for _ in tqdm(range(horizon), desc = 'rendering', leave = False):
         obs_tensor = torch.from_numpy(obs).float().unsqueeze(0)
         action = policy(obs_tensor)
-        if isinstance(action, tuple):
-            action = action[0]
         action_np = action.squeeze(0).cpu().numpy()
 
         obs, _, term, trunc, _ = env.step(action_np)
 
         renderer.update_scene(env.data, camera = camera)
+
+        if show_command_arrow:
+            add_command_arrow(renderer.scene, env, command)
+
         frames.append(renderer.render())
 
         if term or trunc:
@@ -603,23 +640,23 @@ class MicroduckPolicy(Module):
     def forward(self, obs):
         return self.net(obs).clamp(-1.0, 1.0)
 
-# environment wrapper for EvoStrategy
 
 class MicroduckEnvironment(Module):
     def __init__(
         self,
         mjcf_path: Path | str | None = None,
         horizon: int = 400,
-        forced_swing: float = 0.25,
+        forced_swing: float | None = None,
         kp_mult: float = 3.0,
-        command: tuple[float, float] = (0.15, 0.0),
-        repeats: int = 1,
+        command: tuple[float, float] | None = None,
+        anchor_command: tuple[float, float] | None = (0.15, 0.0),
+        repeats: int = 2,
         seed: int = 42
     ):
         super().__init__()
         self.horizon = horizon
-        self.forced_swing = forced_swing
         self.command = command
+        self.anchor_command = anchor_command
         self.repeats = repeats
         self.env = MicroduckGaitEnv(
             mjcf_path = mjcf_path,
@@ -636,16 +673,22 @@ class MicroduckEnvironment(Module):
         device = next(model.parameters()).device
         total_reward = 0.0
 
-        for _ in range(self.repeats):
+        for repeat in range(self.repeats):
             seed = torch.randint(0, int(1e9), ()).item()
-            obs = self.env.reset(seed = seed, command = self.command)
+
+            if exists(self.command):
+                command = self.command
+            elif exists(self.anchor_command):
+                command = self.anchor_command if repeat % 2 == 0 else None
+            else:
+                command = None
+
+            obs = self.env.reset(seed = seed, command = command)
             ep_reward = 0.0
 
             for _ in range(self.horizon):
                 obs_tensor = torch.from_numpy(obs).float().to(device).unsqueeze(0)
                 action = model(obs_tensor)
-                if isinstance(action, tuple):
-                    action = action[0]
                 action_np = action.squeeze(0).detach().cpu().numpy()
 
                 obs, reward, term, trunc, _ = self.env.step(action_np)
@@ -668,16 +711,18 @@ def train(
     mirror_sampling: bool = True,
     hidden_dim: int = 128,
     horizon: int = 400,
-    forced_swing: float = 0.25,
+    eval_horizon: int | None = None,
+    forced_swing: float | None = None,
     kp_mult: float = 3.0,
-    command: tuple[float, float] = (0.15, 0.0),
+    command: tuple[float, float] | None = None,
+    eval_command: tuple[float, float] = (0.15, 0.0),
     eval_every: int = 50,
     eval_video: bool = True,
     checkpoint_dir: str = 'checkpoints-microduck',
     checkpoint_every: int = 100,
     video_dir: str = 'videos',
     seed: int = 42,
-    repeats: int = 1,
+    repeats: int = 2,
     cpu: bool = True,
     init_policy: str | None = None,
     resume: bool = False,
@@ -688,21 +733,33 @@ def train(
         num_generations = 2
         noise_population_size = 4
         horizon = 50
+        eval_horizon = 50
         eval_every = 1
         checkpoint_every = 1
+
+    eval_horizon = default(eval_horizon, horizon)
 
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    is_main = int(os.environ.get('RANK', 0)) == 0
+    command = parse_command(command)
+    eval_command = parse_command(eval_command)
+
+    is_main = int(os.environ.get('RANK', '0')) == 0
 
     ckpt_dir = Path(checkpoint_dir)
-    ckpt_dir.mkdir(parents = True, exist_ok = True)
+
+    try:
+        ckpt_dir.mkdir(parents = True, exist_ok = True)
+    except FileExistsError:
+        pass
 
     video_path = Path(video_dir)
-    if is_main and clear_videos and video_path.exists():
-        shutil.rmtree(video_path)
-    video_path.mkdir(parents = True, exist_ok = True)
+
+    if is_main:
+        if clear_videos and video_path.exists():
+            shutil.rmtree(video_path)
+        video_path.mkdir(parents = True, exist_ok = True)
 
     best_ckpt = ckpt_dir / 'best.pt'
     last_ckpt = ckpt_dir / 'last.pt'
@@ -713,6 +770,7 @@ def train(
         forced_swing = forced_swing,
         kp_mult = kp_mult,
         command = command,
+        anchor_command = eval_command,
         repeats = repeats,
         seed = seed,
     )
@@ -737,24 +795,25 @@ def train(
 
     if exists(init_policy) and Path(init_policy).exists():
         policy.load_state_dict(torch.load(init_policy, map_location = 'cpu'))
+
         if is_main:
             print(f'[microduck] warm-started policy from {init_policy}', flush = True)
             eval_init = evaluate_gait(
                 policy,
                 seeds = (0, 1, 2),
-                horizon = horizon,
+                horizon = eval_horizon,
                 forced_swing = forced_swing,
-                command = command,
+                command = eval_command,
                 kp_mult = kp_mult,
             )
             best_eval_steps, best_eval_x, best_eval_ret = eval_init[0], eval_init[1], eval_init[2]
-            print(f'[microduck] baseline: steps: {best_eval_steps:.1f}/{horizon} | x: {best_eval_x:+.2f}m | ret: {best_eval_ret:.1f}', flush = True)
+            torch.save(policy.state_dict(), best_ckpt)
+            print(f'[microduck] baseline: steps: {best_eval_steps:.1f}/{eval_horizon} | x: {best_eval_x:+.2f}m | ret: {best_eval_ret:.1f}', flush = True)
 
     consecutive_full_walks = 0
-    last_video_gen = -eval_every
 
     def on_generation_callback(generation, fitnesses, current_model):
-        nonlocal best_eval_steps, best_eval_ret, best_eval_x, consecutive_full_walks, last_video_gen
+        nonlocal best_eval_steps, best_eval_ret, best_eval_x, consecutive_full_walks
 
         mean_fit = float(fitnesses.mean().item())
         max_fit = float(fitnesses.max().item())
@@ -767,9 +826,9 @@ def train(
         eval_out = evaluate_gait(
             current_model,
             seeds = (0, 1, 2),
-            horizon = horizon,
+            horizon = eval_horizon,
             forced_swing = forced_swing,
-            command = command,
+            command = eval_command,
             kp_mult = kp_mult,
         )
         eval_steps, eval_x, eval_ret = eval_out[0], eval_out[1], eval_out[2]
@@ -792,19 +851,16 @@ def train(
 
         # render video on evaluation
 
-        should_render = eval_video
-
         vid_path_str = ''
-        if should_render:
-            last_video_gen = generation
+        if eval_video:
             vid_path = Path(video_dir) / f'eval_gen{generation:05d}_steps{eval_steps:03.0f}.mp4'
             try:
                 render_gait(
                     current_model,
-                    horizon = horizon,
+                    horizon = eval_horizon,
                     out_path = str(vid_path),
                     forced_swing = forced_swing,
-                    command = command,
+                    command = eval_command,
                     kp_mult = kp_mult,
                 )
                 shutil.copyfile(vid_path, Path(video_dir) / 'microduck_best.mp4')
@@ -814,7 +870,7 @@ def train(
 
         print(
             f'\n[eval gen {generation:5d}/{num_generations}] '
-            f'steps: {eval_steps:5.1f}/{horizon} '
+            f'steps: {eval_steps:5.1f}/{eval_horizon} '
             f'| x: {eval_x:+.2f}m | ret: {eval_ret:8.1f} '
             f'| pop fit (mean/max): {mean_fit:7.1f}/{max_fit:7.1f} '
             f'| best: {best_eval_steps:5.1f} steps{vid_path_str}'
@@ -824,13 +880,13 @@ def train(
 
         # check convergence condition: full horizon walk with forward progress
 
-        if eval_steps >= (horizon - 5) and eval_x >= 0.20:
+        if eval_steps >= (eval_horizon - 5) and eval_x >= 0.20:
             consecutive_full_walks += 1
             if consecutive_full_walks >= 3:
                 torch.save(current_model.state_dict(), winner_ckpt)
                 print(
                     f'\n*** [convergence achieved] ***\n'
-                    f'microduck walked full {horizon} steps ({eval_x:+.2f}m) for 3 consecutive evaluations!\n'
+                    f'microduck walked full {eval_horizon} steps ({eval_x:+.2f}m) for 3 consecutive evaluations!\n'
                     f'saved winner checkpoint to {winner_ckpt}',
                     flush = True
                 )
@@ -838,10 +894,10 @@ def train(
                     try:
                         render_gait(
                             current_model,
-                            horizon = horizon,
+                            horizon = eval_horizon,
                             out_path = str(Path(video_dir) / 'microduck_winner.mp4'),
                             forced_swing = forced_swing,
-                            command = command,
+                            command = eval_command,
                             kp_mult = kp_mult,
                         )
                     except Exception:

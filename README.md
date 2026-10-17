@@ -73,13 +73,15 @@ $ uv run torchrun --nproc_per_node=8 train_lunar.py --cpu True --noise_populatio
 
 ## Sim-to-Real Bipedal Locomotion (Microduck)
 
-You can train a walking gait for the [Microduck](https://github.com/pollen-robotics/reachy2_microduck) biped robot from scratch using `EvoStrategy` and `torchrun`.
+Train a command-conditioned walking gait for the [Microduck](https://github.com/pollen-robotics/reachy2_microduck) biped robot from scratch using `EvoStrategy` and `torchrun`. The four driven leg joints follow an inline `CPG`; the policy controls swing, knee scale, phase offsets, and the remaining joint targets.
 
-With a population size of 128 distributed across 8 CPU processes, a forward walking gait emerges around **150 generations** (~3-4 minutes):
+With 8 CPU processes, a stable gait typically emerges within a few hundred generations:
 
 ```shell
 $ uv run torchrun --nproc_per_node=8 train_microduck.py
 ```
+
+Training samples random linear and angular velocity commands by default. Evaluations use `--eval_command` (default `0.15,0`); rendered videos show a 3D arrow above the duck's head pointing along the commanded motion. Use `--horizon 800` for 16-second episodes.
 
 To render evaluation videos or resume from the saved best checkpoint:
 
