@@ -339,8 +339,6 @@ def main(
 
     evo_kwargs = dict(
         environment = env,
-        vectorized = vectorized,
-        vector_size = num_envs,
         cpu = cpu,
         num_generations = 1,
         noise_population_size = noise_population_size,

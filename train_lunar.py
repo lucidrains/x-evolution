@@ -9,22 +9,23 @@
 # ///
 
 import os
+
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
-import fire
 from shutil import rmtree
 
-import numpy as np
+import fire
 import gymnasium as gym
-
+import numpy as np
 import torch
 import torch.distributed as dist
-from torch.nn import Module
 import torch.nn.functional as F
+from torch.nn import Module
 from torch.optim.lr_scheduler import CosineAnnealingLR
-
 from x_mlps_pytorch.residual_normed_mlp import ResidualNormedMLP
-from x_evolution import EvoStrategy
+
+from x_evolution import CMAEvoStrategy, EvoStrategy
+
 
 class LunarEnvironment(Module):
     def __init__(
@@ -109,45 +110,94 @@ class LunarEnvironment(Module):
 
         return cum_reward / self.repeats
 
+# both algorithms share the same actor, environment, population, noise scale,
+# and checkpoint naming. switch with:
+#
+#   python train_lunar.py --algorithm es
+#   python train_lunar.py --algorithm cma
+
 def main(
+    algorithm = 'es',                   # es | cma
     vectorized = False,
     num_envs = 8,
     cpu = False,
     fitness_to_weighted_factor = 'normalize',
-    noise_population_size = 50
+    noise_population_size = 50,
+    noise_scale = 1e-2,
+    sep_cma = False,
+    num_generations = 50_000,
+    env_repeats = 2,
+    max_steps = 500,
+    checkpoint_every = None,
+    checkpoint_path = './checkpoints',
+    verbose = True
 ):
+    assert algorithm in ('es', 'cma'), 'algorithm must be es or cma'
+
+    # cma-es does not support vectorized environments
+
+    if algorithm == 'cma' and vectorized:
+        print('CMAES: vectorized environment is not supported, using a single environment')
+        vectorized = False
+        num_envs = 1
+
     actor = ResidualNormedMLP(dim_in = 8, dim = 24, depth = 2, residual_every = 1, dim_out = 4)
+
+    environment = LunarEnvironment(
+        repeats = env_repeats,
+        max_steps = max_steps,
+        vectorized = vectorized,
+        num_envs = num_envs
+    )
 
     def on_result(fitness, pbar):
         pbar.set_postfix(reward = f'{fitness:.3f}')
 
-    evo_strat = EvoStrategy(
-        actor,
-        environment = LunarEnvironment(
-            repeats = 2,
-            vectorized = vectorized,
-            num_envs = num_envs
-        ),
-        vectorized = vectorized,
-        vector_size = num_envs,
-        cpu = cpu,
-        fitness_to_weighted_factor = fitness_to_weighted_factor,
-        num_generations = 50_000,
-        noise_population_size = noise_population_size,
-        noise_low_rank = 1,
-        noise_scale = 1e-2,
-        noise_scale_clamp_range = (5e-3, 2e-2),
-        learned_noise_scale = True,
-        use_sigma_optimizer = True,
-        learning_rate = 1e-3,
-        noise_scale_learning_rate = 1e-4,
-        use_scheduler = True,
-        scheduler_klass = CosineAnnealingLR,
-        scheduler_kwargs = dict(T_max = 50_000),
-        on_result = on_result
-    )
+    if algorithm == 'es':
+        evo_strat = EvoStrategy(
+            actor,
+            environment = environment,
+            cpu = cpu,
+            fitness_to_weighted_factor = fitness_to_weighted_factor,
+            num_generations = num_generations,
+            noise_population_size = noise_population_size,
+            noise_low_rank = 1,
+            noise_scale = noise_scale,
+            noise_scale_clamp_range = (5e-3, 2e-2),
+            learned_noise_scale = True,
+            use_sigma_optimizer = True,
+            learning_rate = 1e-3,
+            noise_scale_learning_rate = 1e-4,
+            use_scheduler = True,
+            scheduler_klass = CosineAnnealingLR,
+            scheduler_kwargs = dict(T_max = num_generations),
+            on_result = on_result,
+            checkpoint_every = checkpoint_every,
+            checkpoint_path = checkpoint_path,
+            verbose = verbose
+        )
+    else:
+        # es evaluates each seed and its mirror, so match rollouts per generation
 
-    evo_strat()
+        evo_strat = CMAEvoStrategy(
+            actor,
+            environment = environment,
+            num_generations = num_generations,
+            population_size = noise_population_size * 2,
+            mirror_sampling = False,
+            sep_cma = sep_cma,
+            noise_scale = noise_scale,
+            lora_rank = 1,
+            freeze_base = False,
+            rollout_fixed_seed = True,
+            on_result = on_result,
+            checkpoint_every = checkpoint_every,
+            checkpoint_path = checkpoint_path,
+            cpu = cpu,
+            verbose = verbose
+        )
+
+    evo_strat(filename = algorithm)
 
     # cleanup
 

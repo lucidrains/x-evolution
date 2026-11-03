@@ -6,8 +6,6 @@ from torch.optim.lr_scheduler import LambdaLR
 
 # model
 
-from torch import nn
-
 model = nn.Sequential(
     nn.Linear(2, 16),
     nn.ReLU(),
@@ -59,8 +57,6 @@ def main(
     evo_strat = EvoStrategy(
         model,
         environment = lambda model: xor_environment(model, num_envs = num_envs, vectorized = vectorized, batch_size = batch_size),
-        vectorized = vectorized,
-        vector_size = num_envs,
         noise_population_size = 100,
         noise_low_rank = 1,
         num_generations = 100_000,

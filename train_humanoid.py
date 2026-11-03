@@ -193,8 +193,6 @@ def main(
             vectorized = vectorized,
             num_envs = num_envs
         ),
-        vectorized = vectorized,
-        vector_size = num_envs,
         num_generations = 50_000,
         noise_population_size = 200,
         noise_low_rank = 1,

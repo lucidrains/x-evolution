@@ -73,8 +73,6 @@ def main(
     evo_strat = EvoStrategy(
         model,
         environment = lambda model: mnist_environment(model, num_envs = num_envs, vectorized = vectorized, batch_size = batch_size),
-        vectorized = vectorized,
-        vector_size = num_envs,
         noise_population_size = 100,
         noise_scale = 1e-2,
         noise_scale_clamp_range = (8e-3, 2e-2),

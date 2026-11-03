@@ -7,9 +7,9 @@ from pathlib import Path
 from functools import partial
 
 import torch
-from torch import tensor, Tensor, stack, is_tensor, arange, randint
+from torch import tensor, Tensor, stack, arange, randint
 from torch.nn import Module, ModuleList, Parameter, ParameterList
-from torch.optim import SGD, Adam, Optimizer
+from torch.optim import SGD, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
 
 import torch.distributed as dist
@@ -32,7 +32,7 @@ from torch_einops_utils import pack_with_inverse
 
 # constants
 
-MAX_SEED_VALUE = int(2 ** 32)
+MAX_SEED_VALUE = 2 ** 32
 
 # helper functions
 
@@ -54,13 +54,50 @@ def accum_grad_(t, value):
     else:
         t.grad.add_(value)
 
+def to_float(reward):
+    if isinstance(reward, Tensor):
+        return reward.mean().item()
+
+    return float(reward)
+
+def resolve_rewards(rewards, scope, scope_names):
+    # scalar, or one reward per scope as a dict, tuple, or list
+
+    if isinstance(rewards, (dict, list, tuple)):
+        assert exists(scope_names), 'environment returned one reward per scope, but no scopes were defined'
+
+        if isinstance(rewards, dict):
+            assert set(rewards) == set(scope_names), f'reward keys {list(rewards)} must match scope names {scope_names}'
+            rewards = [rewards[name] for name in scope_names]
+        else:
+            assert len(rewards) == len(scope_names), f'environment returned {len(rewards)} rewards, expected one per scope {scope_names}'
+            rewards = list(rewards)
+    else:
+        return to_float(rewards)
+
+    if exists(scope):
+        return to_float(rewards[scope_names.index(scope)])
+
+    return [to_float(reward) for reward in rewards]
+
+def resolve_params_to_names(params, param_to_name_index):
+    if isinstance(params, Module):
+        params = list(params.parameters())
+    elif is_bearable(params, list[Module]):
+        params = list(ModuleList(params).parameters())
+
+    if is_bearable(params, list[Parameter]):
+        return {param_to_name_index[param] for param in set(params)}
+
+    return set(params)
+
 # fitness weighting factors
 
 def normalize(t, eps = 1e-6):
     return F.layer_norm(t, t.shape, eps = eps)
 
 def centered_rank_normalize(fitnesses):
-    dtype, device, n = fitnesses.dtype, fitnesses.device, fitnesses.numel()
+    dtype, n = fitnesses.dtype, fitnesses.numel()
     flat_fitnesses, inverse = pack_with_inverse(fitnesses, '*')
     ranks = flat_fitnesses.argsort().argsort().to(dtype = dtype)
     ranks = (ranks / (n - 1)) - 0.5
@@ -75,9 +112,54 @@ FitnessWeightFactorType = Literal['normalize', 'centered_rank']
 
 ParametersToOptimize = list[str] | Module | list[Module] | list[Parameter]
 
+# base class
+
+class EvolutionStrategy(Module):
+
+    @property
+    def device(self):
+        return self.accelerate.device
+
+    @property
+    def is_distributed(self):
+        return self.accelerate.num_processes > 1
+
+    def wait_for_everyone(self):
+        if not (self.is_distributed and dist.is_available() and dist.is_initialized()):
+            return
+
+        dist.barrier()
+
+    @torch.no_grad()
+    def sync_model_params_and_buffers_(self):
+        if not (self.is_distributed and dist.is_available() and dist.is_initialized()):
+            return
+
+        for param in self.model.parameters():
+            dist.broadcast(param, src = 0)
+
+        for buffer in self.model.buffers():
+            dist.broadcast(buffer, src = 0)
+
+    def _resolve_params_to_names(self, params):
+        return resolve_params_to_names(params, self._param_to_name_index)
+
+    def print(self, *args, **kwargs):
+        if not self.verbose:
+            return
+
+        return self.accelerate.print(*args, **kwargs)
+
+    def checkpoint(self, filename = 'evolved.model'):
+        if self.accelerate.is_main_process:
+            filepath = self.checkpoint_folder / f'{filename}.pt'
+            torch.save(self.model.state_dict(), str(filepath))
+
+        self.wait_for_everyone()
+
 # class
 
-class EvoStrategy(Module):
+class EvoStrategy(EvolutionStrategy):
 
     @beartype
     def __init__(
@@ -119,15 +201,11 @@ class EvoStrategy(Module):
         reject_generation_fitnesses_if: Callable[[Tensor], bool] | None = None,
         on_result: Callable | None = None,
         on_generation: Callable | None = None,
-        vectorized = False,
-        vector_size: int | None = None,
         sync_on_init = True
     ):
         super().__init__()
         self.verbose = verbose
 
-        self.vectorized = vectorized
-        self.vector_size = vector_size
         self.on_result = on_result
         self.on_generation = on_generation
 
@@ -207,15 +285,10 @@ class EvoStrategy(Module):
 
         # validate
 
-        assert all([name in param_names for name in params_to_optimize])
+        assert all(name in param_names for name in params_to_optimize)
         assert len(params_to_optimize) > 0, 'nothing to optimize'
 
-        # sort param names and store
-
-        param_names_list = list(params_to_optimize)
-        param_names_list.sort()
-
-        self.param_names_to_optimize = param_names_list
+        self.param_names_to_optimize = sorted(params_to_optimize)
 
         # shapes
 
@@ -228,7 +301,7 @@ class EvoStrategy(Module):
         # hyperparameters
 
         self.noise_population_size = noise_population_size
-        self.num_params = len(param_names_list) # just convenience for generating all the seeds for all the randn for the proposed memory efficient way
+        self.num_params = len(self.param_names_to_optimize)
 
         self.num_generations = num_generations
 
@@ -300,53 +373,7 @@ class EvoStrategy(Module):
         self.checkpoint_every = checkpoint_every
 
         self.checkpoint_folder = Path(checkpoint_path)
-        self.checkpoint_folder.mkdir(exist_ok = True)
-
-    @property
-    def device(self):
-        return self.accelerate.device
-
-    @property
-    def is_distributed(self):
-        return self.accelerate.num_processes > 1
-
-    def wait_for_everyone(self):
-        if not (self.is_distributed and dist.is_available() and dist.is_initialized()):
-            return
-
-        dist.barrier()
-
-    @torch.no_grad()
-    def sync_model_params_and_buffers_(self):
-        if not (self.is_distributed and dist.is_available() and dist.is_initialized()):
-            return
-
-        for param in self.model.parameters():
-            dist.broadcast(param, src = 0)
-
-        for buffer in self.model.buffers():
-            dist.broadcast(buffer, src = 0)
-
-    def _resolve_params_to_names(
-        self,
-        params: ParametersToOptimize
-    ):
-
-        if isinstance(params, Module):
-            params = list(params.parameters())
-        elif is_bearable(params, list[Module]):
-            params = list(ModuleList(params).parameters())
-
-        if is_bearable(params, list[Parameter]):
-            params = [self._param_to_name_index[param] for param in set(params)]
-
-        return set(params)
-
-    def print(self, *args, **kwargs):
-        if not self.verbose:
-            return
-
-        return self.accelerate.print(*args, **kwargs)
+        self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
 
     def _get_noise_scale(self, param_name):
         if not self.learned_noise_scale:
@@ -354,34 +381,6 @@ class EvoStrategy(Module):
 
         sigma_index = self.param_name_to_sigma_index[param_name]
         return self.sigmas[sigma_index]
-
-    @staticmethod
-    def _to_float(reward):
-        if isinstance(reward, Tensor):
-            return reward.mean().item()
-
-        return float(reward)
-
-    def _resolve_rewards(self, rewards, scope):
-        # a reward is a scalar, or one reward per scope as a dict, tuple, or list
-        # resolves to a float, or to a list of floats in scope order, with a scope picking out its own reward
-
-        if isinstance(rewards, (dict, list, tuple)):
-            assert exists(self.scope_names), 'environment returned one reward per scope, but no scopes were defined in params_to_optimize'
-
-            if isinstance(rewards, dict):
-                assert set(rewards) == set(self.scope_names), f'reward keys {list(rewards)} must match scope names {self.scope_names}'
-                rewards = [rewards[name] for name in self.scope_names]
-            else:
-                assert len(rewards) == len(self.scope_names), f'environment returned {len(rewards)} rewards, expected one per scope {self.scope_names}'
-                rewards = list(rewards)
-        else:
-            return self._to_float(rewards)
-
-        if exists(scope):
-            return self._to_float(rewards[self.scope_names.index(scope)])
-
-        return [self._to_float(reward) for reward in rewards]
 
     @torch.inference_mode()
     def evolve_(
@@ -493,15 +492,6 @@ class EvoStrategy(Module):
 
             for sigma in self.sigmas:
                 self.sigma_clamp_(sigma)
-
-    def checkpoint(self, filename = 'evolved.model'):
-
-        if self.accelerate.is_main_process:
-
-            filepath = self.checkpoint_folder / f'{filename}.pt'
-            torch.save(self.model.state_dict(), str(filepath))
-
-        self.wait_for_everyone()
 
     @torch.inference_mode()
     def forward(
@@ -634,7 +624,7 @@ class EvoStrategy(Module):
                             env = self.environments[scope] if exists(scope) and exists(self.environments) else self.environment
                             fitness = rollout(env)(model)
 
-                        fitness = self._resolve_rewards(fitness, scope)
+                        fitness = resolve_rewards(fitness, scope, self.scope_names)
 
                     if isinstance(fitness, list):
                         assert not dynamic_params, 'per-scope rewards were returned, so pass `scope = ...` instead of `params_to_optimize = ...`'
@@ -697,14 +687,11 @@ class EvoStrategy(Module):
             fitnesses = fitnesses[:pop_size]
             seeds_for_population = seeds_for_population[:pop_size]
 
-            # store
-
-            fitnesses_across_generations.append(fitnesses)
-
             # validate fitnesses
 
             if exists(self.reject_generation_fitnesses_if) and self.reject_generation_fitnesses_if(fitnesses):
                 self.print(f'[{generation}] fitnesses rejected')
+                generation += 1
                 continue
 
             # one joint population - with per-scope rewards, each scope is updated with its own column
@@ -714,6 +701,10 @@ class EvoStrategy(Module):
                     self.evolve_(scope_fitnesses, seeds_for_population, scoped_names = self.scopes[name])
             else:
                 self.evolve_(fitnesses, seeds_for_population, scoped_names = scoped_names)
+
+            # store
+
+            fitnesses_across_generations.append(fitnesses)
 
             # on generation callback
 
