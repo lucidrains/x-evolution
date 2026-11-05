@@ -1,217 +1,546 @@
 # /// script
 # dependencies = [
+#     "einops",
 #     "fire",
 #     "gymnasium[box2d]>=1.0.0",
 #     "gymnasium[other]",
-#     "x-evolution>=0.0.20",
-#     "x-transformers",
-#     "wandb"
+#     "imageio[ffmpeg]",
+#     "numpy",
+#     "torch",
+#     "torch-einops-utils>=0.2.4",
+#     "wandb",
+#     "x-evolution>=0.2.1"
 # ]
 # ///
 
+from __future__ import annotations
+
 import os
 import re
-import fire
-from shutil import rmtree
-from itertools import cycle
-from collections import deque
+import math
+import time
+from pathlib import Path
+from collections import deque, namedtuple
 
+import fire
+import imageio.v2 as imageio
 import numpy as np
 import gymnasium as gym
 import wandb
-from tqdm import tqdm
 
 import torch
-from torch import nn
-from torch.nn import Module
+from torch import nn, Tensor, tensor, zeros, full
 import torch.nn.functional as F
+from torch.nn import Module, ModuleList, Parameter
 import torch.distributed as dist
+
+from einops import repeat, einsum, rearrange
+from einops.layers.torch import Rearrange
+
+from torch_einops_utils import (
+    cast_tensor,
+    clamp,
+    entropy,
+    pack_with_inverse,
+    pad_right_at_dim,
+    safe_stack,
+    temp_eval
+)
+from torch_einops_utils.device import module_device
 
 from accelerate import Accelerator
 
-from x_evolution import EvoStrategy
-from x_transformers import Decoder
+from x_evolution import CMAEvoStrategy
+
+torch.set_num_threads(1)
+
+# types
+
+Memory = namedtuple('Memory', (
+    'step',
+    'latents',
+    'chunks'
+))
 
 # helpers
 
 def exists(v):
     return v is not None
 
+def default(v, d):
+    return v if exists(v) else d
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def log(t, eps = 1e-20):
+    return t.clamp_min(eps).log()
+
+def resolve_hierarchies(hierarchies: tuple[int, ...] | int) -> tuple[int, ...]:
+    if isinstance(hierarchies, int):
+        return tuple(2 ** i for i in range(hierarchies))
+    return tuple(int(stride) for stride in hierarchies)
+
+# combined hierarchical auxiliary loss
+
+def hierarchical_auxiliary_loss(
+    all_code_probs: Tensor,
+    pos_code_probs: Tensor | None = None,
+    pos_cf_action_probs: Tensor | None = None,
+    pos_target_actions: Tensor | None = None,
+    coupling_loss_weight = 1.5,
+    latent_mi_weight = 3.0
+):
+    zero = tensor(0., device = all_code_probs.device, requires_grad = True)
+
+    # normalized mutual info between states and latent codes
+    # encourages diverse prototype usage across trajectory states while keeping per-state selection decisive
+
+    num_classes = all_code_probs.shape[-1]
+
+    if num_classes > 1 and all_code_probs.shape[-2] > 1:
+        marginal = all_code_probs.mean(dim = -2)
+        latent_mi = (entropy(marginal) - entropy(all_code_probs)) / math.log(num_classes)
+    else:
+        latent_mi = zero
+
+    # composed counterfactual action coupling loss on above-average episodes
+    # marginalizes counterfactual action probs over higher-level code probs to match taken actions
+
+    if exists(pos_code_probs) and exists(pos_cf_action_probs) and exists(pos_target_actions):
+        composed_probs = einsum(pos_code_probs, pos_cf_action_probs, 'n k, n k a -> n a')
+        couple_loss = F.nll_loss(log(composed_probs), pos_target_actions.long())
+    else:
+        couple_loss = zero
+
+    return coupling_loss_weight * couple_loss - latent_mi_weight * latent_mi
+
 # schedule parsing
 
 def parse_string_schedule(schedule_str):
-    schedule_str = re.sub(r'\(([^)]+)\)\s*\*\s*(\d+)', lambda m: f" {m.group(1)} " * int(m.group(2)), schedule_str)
+    schedule_str = re.sub(r'\(([^)]+)\)\s*\*\s*(\d+)', lambda m: f' {m.group(1)} ' * int(m.group(2)), schedule_str)
 
-    phases = []
-    for duration, phase in re.findall(r'(\d+)\s*(all|head|trunk|tail)', schedule_str.lower()):
-        phases.extend([phase] * int(duration))
+    phases = [
+        (phase, int(duration))
+        for duration, phase in re.findall(r'(\d+)\s*(all|level_\d+)', schedule_str.lower())
+    ]
 
     assert len(phases) > 0, 'could not parse phase schedule string'
     return phases
 
-# orthogonal update from trunk to head
+# 2d affine linear layer so cma-es jointly evolves weights and biases
 
-def orthogonal_project(x, residual):
-    dtype = residual.dtype
-
-    if x.device.type != 'mps':
-        residual, x = residual.double(), x.double()
-
-    unit = F.normalize(residual, dim = -1)
-    parallel = (x * unit).sum(dim = -1, keepdim = True) * unit
-    orthogonal = x - parallel
-
-    return orthogonal.to(dtype)
-
-# hierarchical transformer
-# head -> trunk (residual gated every trunk_update_every steps) -> tail
-
-class HierarchicalTransformer(Module):
+class AffineLinear(Module):
     def __init__(
         self,
         dim_in,
-        dim,
-        num_actions,
-        head_depth = 1,
-        trunk_depth = 1,
-        tail_depth = 1,
-        trunk_update_every = 1
+        dim_out,
+        bias_scale = 0.25,
+        init_gain = None
     ):
         super().__init__()
-        self.trunk_update_every = trunk_update_every
+        self.bias_scale = bias_scale
+        self.weight = Parameter(torch.empty(dim_out, dim_in + 1))
 
-        self.trunk_update_emb = nn.Parameter(torch.zeros(dim))
+        if exists(init_gain):
+            nn.init.orthogonal_(self.weight[:, :-1], gain = init_gain)
+            nn.init.zeros_(self.weight[:, -1])
+        else:
+            nn.init.kaiming_uniform_(self.weight, a = 5 ** 0.5)
 
-        self.token_emb = nn.Linear(dim_in, dim)
+    def forward(self, x):
+        return F.linear(pad_right_at_dim(x, 1, value = self.bias_scale), self.weight)
 
-        decoder_kwargs = dict(
-            dim = dim,
-            attn_dim_head = 32,
-            rotary_pos_emb = True,
-            rotary_emb_dim = 32,
-            pre_norm_has_final_norm = False
+# simba residual block - https://arxiv.org/abs/2410.09754
+
+class SimBaBlock(Module):
+    def __init__(
+        self,
+        dim,
+        expansion_factor = 1,
+        dropout = 0.
+    ):
+        super().__init__()
+        dim_inner = int(dim * expansion_factor)
+
+        self.net = nn.Sequential(
+            nn.RMSNorm(dim),
+            AffineLinear(dim, dim_inner),
+            nn.SiLU(),
+            nn.Dropout(dropout),
+            AffineLinear(dim_inner, dim, init_gain = 0.2)
         )
 
-        self.head = Decoder(depth = head_depth, **decoder_kwargs)
+    def forward(self, x):
+        return x + self.net(x)
 
-        self.state_to_trunk = nn.Linear(dim_in, dim)
+# discrete latent readout and hypernetwork decoder
 
-        self.trunk = Decoder(depth = trunk_depth, **decoder_kwargs)
-        self.trunk_gru_norm = nn.RMSNorm(dim)
-        self.trunk_gru = nn.GRU(dim, dim, batch_first = True)
+class DiscreteLatentReadout(Module):
+    def __init__(
+        self,
+        dim,
+        dim_latent,
+        num_discrete = 4,
+        temperature = 0.7,
+        logit_cap = 3.
+    ):
+        super().__init__()
+        self.num_discrete = num_discrete
+        self.temperature = temperature
+        self.logit_cap = logit_cap
 
-        self.tail = Decoder(depth = tail_depth, **decoder_kwargs)
+        self.norm = nn.RMSNorm(dim)
+        self.to_logits = AffineLinear(dim, num_discrete, init_gain = 0.5)
 
-        self.to_logits = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, num_actions)
+        self.prototypes = Parameter(torch.empty(num_discrete, dim_latent))
+        nn.init.orthogonal_(self.prototypes, gain = (dim_latent ** 0.5) * 0.5)
+
+    def forward(self, x):
+        raw_logits = self.to_logits(self.norm(x))
+        logits = self.logit_cap * torch.tanh(raw_logits / self.logit_cap)
+
+        probs = (logits / self.temperature).softmax(dim = -1)
+        indices = probs.argmax(dim = -1)
+        latents = self.prototypes[indices]
+
+        return latents, probs
+
+class HyperNetworkDecoder(Module):
+    def __init__(
+        self,
+        dim,
+        dim_latent,
+        low_rank = 2,
+        num_time_embeds = 4
+    ):
+        super().__init__()
+        self.num_time_embeds = max(1, num_time_embeds)
+        self.time_emb = nn.Embedding(self.num_time_embeds, dim)
+        self.latent_time_emb = nn.Embedding(self.num_time_embeds, dim_latent)
+        nn.init.normal_(self.time_emb.weight, std = 0.02)
+        nn.init.normal_(self.latent_time_emb.weight, std = 0.02)
+
+        self.decoder = nn.Sequential(
+            nn.RMSNorm(dim_latent),
+            AffineLinear(dim_latent, dim_latent * 2),
+            nn.SiLU(),
+            nn.Linear(dim_latent * 2, 2 * low_rank * dim, bias = False)
         )
 
-        self.trunk_action_gate = nn.Linear(dim, num_actions)
+        weight = self.decoder[-1].weight
+        half = weight.shape[0] // 2
+        nn.init.orthogonal_(weight[:half], gain = 1.)
+        nn.init.zeros_(weight[half:])
 
-        self.trunk_to_logits = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.Linear(dim, num_actions)
+        self.to_hyper_network_weights = Rearrange('... (two d r) -> two ... d r', two = 2, r = low_rank)
+
+    def forward(self, x, latent, time_indices = None):
+        if exists(time_indices):
+            clamped_indices = clamp(time_indices, 0, self.num_time_embeds - 1)
+            x = x + self.time_emb(clamped_indices)
+            latent = latent + self.latent_time_emb(clamped_indices)
+
+        weights_in, weights_out = self.to_hyper_network_weights(self.decoder(latent))
+        return einsum(x, weights_in, weights_out, '... i, ... i r, ... o r -> ... o')
+
+# composable hierarchy level
+
+class HierarchyLevel(Module):
+    def __init__(
+        self,
+        state_dim,
+        dim,
+        dim_latent,
+        *,
+        is_bottom = False,
+        is_top = False,
+        num_actions = 4,
+        num_internal_actions = 4,
+        low_rank = 2,
+        num_time_embeds = 4,
+        dropout = 0.
+    ):
+        super().__init__()
+        self.is_bottom = is_bottom
+        self.is_top = is_top
+
+        self.proj_in = AffineLinear(state_dim, dim)
+        self.stem = SimBaBlock(dim, dropout = dropout)
+
+        if not is_top:
+            self.from_higher = HyperNetworkDecoder(
+                dim,
+                dim_latent,
+                low_rank = low_rank,
+                num_time_embeds = num_time_embeds
+            )
+
+        self.upper = SimBaBlock(dim, dropout = dropout)
+
+        if is_bottom:
+            self.action_head = nn.Sequential(
+                AffineLinear(dim, dim // 2),
+                nn.SiLU(),
+                nn.Linear(dim // 2, num_actions, bias = False)
+            )
+            nn.init.orthogonal_(self.action_head[-1].weight, gain = 0.5)
+        else:
+            self.readout = DiscreteLatentReadout(dim, dim_latent, num_discrete = num_internal_actions)
+            self.residual_proj = nn.Linear(dim, dim_latent, bias = False)
+            nn.init.zeros_(self.residual_proj.weight)
+            self.register_buffer('gate', tensor(0.))
+
+    def encode_stem(self, state):
+        return self.stem(self.proj_in(state))
+
+    def forward(
+        self,
+        state,
+        latent_from_higher = None,
+        time_indices = None
+    ):
+        hidden = self.encode_stem(state)
+
+        if not self.is_top and exists(latent_from_higher):
+            hidden = hidden + self.from_higher(hidden, latent_from_higher, time_indices = time_indices)
+
+        upper_hidden = self.upper(hidden)
+
+        if self.is_bottom:
+            return self.action_head(upper_hidden)
+
+        latent, probs = self.readout(upper_hidden)
+        latent = self.gate * (latent + self.residual_proj(upper_hidden))
+        return latent, probs
+
+# hierarchical actor
+
+class HierarchicalActor(Module):
+    def __init__(
+        self,
+        state_dim = 8,
+        hidden_dim = 4,
+        num_actions = 4,
+        num_internal_actions = 4,
+        dim_latent = 4,
+        low_rank = 1,
+        hierarchies: tuple[int, ...] = (1, 4),
+        phase_shifts: tuple[int, ...] | None = None,
+        coupling_loss_weight = 1.5,
+        latent_mi_weight = 3.0,
+        dropout = 0.
+    ):
+        super().__init__()
+        assert len(hierarchies) >= 1 and hierarchies[0] == 1, 'hierarchies must start with base stride 1, e.g. (1, 4)'
+
+        self.state_dim = state_dim
+        self.num_actions = num_actions
+        self.num_internal_actions = num_internal_actions
+        self.dim_latent = dim_latent
+        self.hierarchies = tuple(hierarchies)
+        self.num_levels = len(self.hierarchies)
+
+        self.coupling_loss_weight = coupling_loss_weight
+        self.latent_mi_weight = latent_mi_weight
+
+        phase_shifts = default(phase_shifts, (0,) * self.num_levels)
+        assert len(phase_shifts) == self.num_levels
+        self.phase_shifts = tuple(phase_shifts)
+
+        dim = hidden_dim * 2
+        levels = []
+
+        for level_index in range(self.num_levels):
+            is_bottom = (level_index == 0)
+            is_top = (level_index == self.num_levels - 1)
+            num_time_embeds = max(1, self.hierarchies[level_index + 1] // self.hierarchies[level_index]) if not is_top else 1
+
+            levels.append(HierarchyLevel(
+                state_dim, dim, dim_latent,
+                is_bottom = is_bottom, is_top = is_top,
+                num_actions = num_actions, num_internal_actions = num_internal_actions,
+                low_rank = low_rank, num_time_embeds = num_time_embeds, dropout = dropout
+            ))
+
+        self.levels = ModuleList(levels)
+
+    def enable_level_(self, level_index: int):
+        if 0 < level_index < self.num_levels:
+            self.levels[level_index].gate.fill_(1.)
+
+    def level_parameters(self):
+        groups = dict(all = list(self.parameters()))
+
+        for level_index, level in enumerate(self.levels):
+            params = [*level.proj_in.parameters(), *level.stem.parameters(), *level.upper.parameters()]
+
+            if level.is_bottom:
+                params.extend(level.action_head.parameters())
+            else:
+                params.extend([
+                    *level.readout.parameters(),
+                    *level.residual_proj.parameters(),
+                    *self.levels[level_index - 1].from_higher.parameters()
+                ])
+
+            groups[f'level_{level_index}'] = params
+
+        return groups
+
+    def level_time_indices(self, level_index: int, timesteps: Tensor | int | None):
+        if not exists(timesteps) or level_index >= self.num_levels - 1:
+            return None
+
+        stride_current = self.hierarchies[level_index]
+        stride_higher = self.hierarchies[level_index + 1]
+        shift_higher = self.phase_shifts[level_index + 1]
+        return ((timesteps - shift_higher) % stride_higher) // stride_current
+
+    def counterfactual_action_probs(self, state, level_index = 0, time_indices = None, temperature = 0.5):
+        assert 0 <= level_index < self.num_levels - 1
+
+        state, _ = pack_with_inverse(state, '* d')
+
+        num_codes = self.num_internal_actions
+        receiver = self.levels[level_index]
+        sender = self.levels[level_index + 1]
+
+        hidden = receiver.encode_stem(state).detach()
+        base_logits = receiver.action_head(receiver.upper(hidden))
+
+        repeated_base_logits = repeat(base_logits, 'b a -> (b k) a', k = num_codes)
+        repeated_hidden = repeat(hidden, 'b d -> (b k) d', k = num_codes)
+        repeated_time_indices = repeat(time_indices, 'b -> (b k)', k = num_codes) if exists(time_indices) else None
+        repeated_prototypes = repeat(sender.readout.prototypes, 'k d -> (b k) d', b = hidden.shape[0])
+
+        steered = repeated_hidden + receiver.from_higher(repeated_hidden, repeated_prototypes, time_indices = repeated_time_indices)
+        steered_logits = receiver.action_head(receiver.upper(steered))
+
+        delta_probs = ((steered_logits - repeated_base_logits) / temperature).softmax(dim = -1)
+        return rearrange(delta_probs, '(b k) a -> b k a', k = num_codes)
+
+    def aux_loss(
+        self,
+        memory: Memory | None,
+        episode_returns: Tensor
+    ):
+        device = episode_returns.device
+        zero = tensor(0., device = device)
+
+        if not exists(memory) or len(memory.chunks) <= 1:
+            return zero
+
+        states, probs, actions, masks = map(safe_stack, zip(*memory.chunks))
+
+        all_code_probs = probs[masks]
+
+        if all_code_probs.shape[0] <= 1:
+            return zero
+
+        pos_mask = masks & (episode_returns >= episode_returns.mean())
+
+        pos_probs, pos_cf_probs, pos_actions = None, None, None
+
+        if pos_mask.any():
+            pos_states = states[pos_mask][:64]
+            pos_probs = probs[pos_mask][:64]
+            pos_actions = actions[pos_mask][:64]
+
+            pos_cf_probs = self.counterfactual_action_probs(
+                pos_states,
+                level_index = 0,
+                time_indices = zeros(pos_states.shape[0], dtype = torch.long, device = device)
+            )
+
+        return hierarchical_auxiliary_loss(
+            all_code_probs,
+            pos_probs,
+            pos_cf_probs,
+            pos_actions,
+            coupling_loss_weight = self.coupling_loss_weight,
+            latent_mi_weight = self.latent_mi_weight
         )
 
-    def forward(self, state, step = 0, cache = None):
-        b, n, _ = state.shape
-        assert n == 1, 'only single token rollouts are supported'
+    def forward(
+        self,
+        state: Tensor,
+        memory: Memory | None = None,
+        dones: Tensor | None = None
+    ):
+        state, inverse_pack = pack_with_inverse(state, '* d')
+        batch, device = state.shape[0], state.device
 
-        x = self.token_emb(state)
+        if not exists(memory):
+            step = 0
+            latents = [None] * self.num_levels
+            chunks = []
+        else:
+            step, latents, chunks = memory
+            latents = [*latents]
+            chunks = [*chunks]
 
-        cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update, last_trunk_action = cache if exists(cache) else (None, None, None, None, None, None)
+        timestep = full((batch,), step, dtype = torch.long, device = device)
+        level_1_probs = None
 
-        # head
+        for level_index in reversed(range(1, self.num_levels)):
+            level = self.levels[level_index]
 
-        x, cache_head = self.head(x, cache = cache_head, return_hiddens = True)
+            if level.gate.item() <= 0.:
+                continue
 
-        should_update = (step % self.trunk_update_every) == 0
+            stride = self.hierarchies[level_index]
+            shift = self.phase_shifts[level_index]
 
-        # let the trunk network know when it is an update step
+            if step == 0 or divisible_by(step - shift, stride):
+                time_indices = self.level_time_indices(level_index, timestep)
+                latent_above = latents[level_index + 1] if (level_index + 1) < self.num_levels else None
 
-        x_trunk = x
+                latents[level_index], probs = level(
+                    state,
+                    latent_from_higher = latent_above,
+                    time_indices = time_indices
+                )
 
-        if should_update:
-            x_trunk = x_trunk + self.trunk_update_emb
+                if level_index == 1:
+                    level_1_probs = probs
 
-        # direct residual from state to trunk
+        latent_from_higher = latents[1] if self.num_levels > 1 else None
+        base_time_indices = self.level_time_indices(0, timestep) if exists(latent_from_higher) else None
 
-        x_trunk = x_trunk + self.state_to_trunk(state)
+        action_logits = self.levels[0](
+            state,
+            latent_from_higher = latent_from_higher,
+            time_indices = base_time_indices
+        )
 
-        # trunk - always runs for KV context, but residual only applied every trunk_update_every steps
+        if exists(level_1_probs):
+            actions = action_logits.argmax(dim = -1)
+            active_mask = ~dones if exists(dones) else torch.ones(batch, dtype = torch.bool, device = device)
+            chunks.append((state, level_1_probs, actions, active_mask))
 
-        x_trunk, cache_trunk = self.trunk(x_trunk, cache = cache_trunk, return_hiddens = True)
-
-        x_trunk_gru, cache_gru = self.trunk_gru(self.trunk_gru_norm(x_trunk), cache_gru)
-        x_trunk = x_trunk + x_trunk_gru
-
-        if should_update:
-            last_trunk_update = orthogonal_project(x_trunk, residual = x)
-            last_trunk_action = self.trunk_to_logits(x_trunk)
-
-        if exists(last_trunk_update):
-            x = x + last_trunk_update
-
-        # tail
-
-        x, cache_tail = self.tail(x, cache = cache_tail, return_hiddens = True)
-
-        logits = self.to_logits(x)
-
-        if exists(last_trunk_action):
-            gate = self.trunk_action_gate(x).sigmoid()
-            logits = logits + gate * last_trunk_action
-
-        return logits, (cache_head, cache_trunk, cache_tail, cache_gru, last_trunk_update, last_trunk_action)
+        return inverse_pack(action_logits), Memory(step + 1, latents, chunks)
 
 # environment
 
 class LunarEnvironment(Module):
     def __init__(
         self,
-        video_folder = './recordings',
-        render_every_eps = 500,
+        env_name = 'LunarLander-v3',
+        num_envs = 2,
         max_steps = 500,
-        repeats = 1,
-        vectorized = False,
-        num_envs = 1,
+        eval_seeds: tuple[int, ...] = tuple(range(101, 113)),
         rolling_window = 20
     ):
         super().__init__()
-        self.vectorized = vectorized
+        self.env_name = env_name
         self.num_envs = num_envs
-
-        if vectorized:
-            env = gym.make_vec('LunarLander-v3', num_envs = num_envs, render_mode = 'rgb_array')
-        else:
-            env = gym.make('LunarLander-v3', render_mode = 'rgb_array')
-
-        self.env = env
         self.max_steps = max_steps
-        self.repeats = repeats
-        self.video_folder = video_folder
-        self.render_every_eps = render_every_eps
-        self._pre_main_callback_called = False
+        self.eval_seeds = tuple(eval_seeds)
 
+        max_pool = max(num_envs, len(self.eval_seeds))
+        self.envs = [gym.make(env_name, max_episode_steps = max_steps) for _ in range(max_pool)]
         self.last_steps = deque(maxlen = rolling_window)
-
-    def pre_main_callback(self):
-        if self._pre_main_callback_called:
-            return
-
-        self._pre_main_callback_called = True
-        rmtree(self.video_folder, ignore_errors = True)
-
-        if not self.vectorized:
-            self.env = gym.wrappers.RecordVideo(
-                env = self.env,
-                video_folder = self.video_folder,
-                name_prefix = 'recording',
-                episode_trigger = lambda eps_num: (eps_num % self.render_every_eps) == 0,
-                disable_logger = True
-            )
 
     @property
     def avg_steps(self):
@@ -219,75 +548,139 @@ class LunarEnvironment(Module):
             return 0.
         return sum(self.last_steps) / len(self.last_steps)
 
+    @torch.no_grad()
+    def rollout(self, actor: HierarchicalActor, seeds = None):
+        device = module_device(actor)
+        seeds = default(seeds, self.eval_seeds[:self.num_envs])
+        num_active_envs = len(seeds)
+
+        obs_list = [self.envs[i].reset(seed = int(seeds[i]))[0] for i in range(num_active_envs)]
+        state = np.stack(obs_list, axis = 0)
+
+        cum_reward = np.zeros(num_active_envs, dtype = np.float32)
+        dones = np.zeros(num_active_envs, dtype = bool)
+        steps_taken = np.zeros(num_active_envs, dtype = np.int32)
+
+        memory = None
+
+        for _ in range(self.max_steps):
+            if dones.all():
+                break
+
+            state_tensor = cast_tensor(state, dtype = torch.float32, device = device)
+            dones_tensor = cast_tensor(dones, dtype = torch.bool, device = device)
+
+            action_logits, memory = actor(state_tensor, memory = memory, dones = dones_tensor)
+            actions = action_logits.argmax(dim = -1).tolist()
+
+            for env_idx in np.flatnonzero(~dones):
+                next_obs, reward, terminated, truncated, _ = self.envs[env_idx].step(actions[env_idx])
+                cum_reward[env_idx] += float(reward)
+                steps_taken[env_idx] += 1
+
+                if terminated or truncated:
+                    dones[env_idx] = True
+                else:
+                    state[env_idx] = next_obs
+
+        self.last_steps.append(float(steps_taken.mean()))
+
+        env_return = float(cum_reward.mean())
+        ep_returns = cast_tensor(cum_reward, dtype = torch.float32, device = device)
+        aux_loss = actor.aux_loss(memory, ep_returns)
+        fitness = env_return - float(aux_loss.item())
+
+        return fitness, env_return, cum_reward
+
+    def evaluate(self, actor: HierarchicalActor):
+        return self.rollout(actor, seeds = self.eval_seeds)
+
     def forward(self, model):
-        device = next(model.parameters()).device
-        seed = torch.randint(0, int(1e6), ())
+        actor = model.model if hasattr(model, 'model') else model
+        seeds = torch.randint(0, int(1e6), (self.num_envs,)).tolist()
+        fitness, _, _ = self.rollout(actor, seeds = seeds)
+        return fitness
 
-        num_envs = self.num_envs if self.vectorized else 1
-        cum_reward = torch.zeros(num_envs, device = device)
+# evaluation and video recording
 
-        for _ in range(self.repeats):
-            state, _ = self.env.reset(seed = seed.item())
+@torch.no_grad()
+def record_best_episode_video(
+    actor: HierarchicalActor,
+    env_name: str = 'LunarLander-v3',
+    video_folder: str = './recordings_hierarchical',
+    video_prefix: str = 'hierarchical-best',
+    max_timesteps: int = 500,
+    eval_seeds: tuple[int, ...] = tuple(range(101, 113))
+):
+    device = module_device(actor)
+    env = gym.make(env_name, render_mode = 'rgb_array', max_episode_steps = max_timesteps)
 
-            step = 0
-            dones = torch.zeros(num_envs, device = device, dtype = torch.bool)
-            cache = None
+    best_return = -float('inf')
+    best_frames = []
+    best_seed = eval_seeds[0]
 
-            while step < self.max_steps and not dones.all():
-                state_torch = torch.from_numpy(state).to(device)
+    with temp_eval(actor):
+        for episode_seed in eval_seeds:
+            obs, _ = env.reset(seed = int(episode_seed))
+            state = cast_tensor(obs, dtype = torch.float32, device = device)
 
-                if not self.vectorized:
-                    state_torch = state_torch.unsqueeze(0)
+            memory = None
+            frames = [env.render()]
+            episode_return = 0.
 
-                state_torch = state_torch.unsqueeze(1)
+            for _ in range(max_timesteps):
+                action_logits, memory = actor(state, memory = memory)
+                action = int(action_logits.argmax(dim = -1).item())
 
-                action_logits, cache = model(state_torch, step = step, cache = cache)
-                action_logits = action_logits[:, -1, :]
+                obs, reward, terminated, truncated, _ = env.step(action)
+                episode_return += float(reward)
+                frames.append(env.render())
 
-                action = F.gumbel_softmax(action_logits, hard = True).argmax(dim = -1)
+                if terminated or truncated:
+                    break
 
-                env_action = action.detach().cpu().numpy() if self.vectorized else action.item()
-                next_state, reward, truncated, terminated, *_ = self.env.step(env_action)
+                state = cast_tensor(obs, dtype = torch.float32, device = device)
 
-                reward_np = np.array(reward) if not isinstance(reward, np.ndarray) else reward
-                total_reward = torch.from_numpy(reward_np).float().to(device)
+            if episode_return > best_return:
+                best_return = episode_return
+                best_frames = frames
+                best_seed = int(episode_seed)
 
-                mask = (~dones).float()
-                cum_reward += total_reward * mask
+    env.close()
 
-                dones_np = np.array(truncated | terminated) if not isinstance(truncated | terminated, np.ndarray) else (truncated | terminated)
-                dones |= torch.from_numpy(dones_np).to(device)
+    out_dir = Path(video_folder).resolve()
+    out_dir.mkdir(parents = True, exist_ok = True)
+    mp4_path = out_dir / f'{video_prefix}.mp4'
+    gif_path = out_dir / f'{video_prefix}.gif'
 
-                step += 1
-                state = next_state
+    imageio.mimsave(str(mp4_path), best_frames, fps = 50, macro_block_size = 1)
+    imageio.mimsave(str(gif_path), best_frames[::2], fps = 25)
 
-            self.last_steps.append(step)
-
-        if not self.vectorized:
-            return cum_reward.item() / self.repeats
-
-        return cum_reward / self.repeats
+    print(f'\n[video] best eval return: {best_return:+.1f} (seed={best_seed}) -> {mp4_path}', flush = True)
+    return best_return, str(mp4_path), str(gif_path)
 
 # main
 
 def main(
-    vectorized = False,
-    num_envs = 8,
-    cpu = False,
-    phase_schedule = '200all (50trunk 50tail)*10',
-    trunk_update_every = 2,
-    head_depth = 1,
-    trunk_depth = 1,
-    tail_depth = 1,
-    dim = 64,
-    use_wandb = True,
-    wandb_project = 'lunar-hierarchical-transformer',
-    rolling_window = 20,
-    noise_population_size = 100,
-    learning_rate = 1e-3,
-    noise_scale = 1e-2,
-    checkpoint_file = 'warmup_checkpoint.pt',
-    save_checkpoint_at = 150
+    env_name = 'LunarLander-v3',
+    hierarchies: tuple[int, ...] | int = (1, 4),
+    phase_shifts: tuple[int, ...] | None = None,
+    phase_schedule = '(20level_0 15level_1)*3',
+    num_envs = 2,
+    max_steps = 500,
+    hidden_dim = 4,
+    dim_latent = 4,
+    low_rank = 1,
+    num_internal_actions = 4,
+    population_size = 24,
+    noise_scale = 0.15,
+    seed = 42,
+    cpu = True,
+    render = True,
+    video_folder = './recordings_hierarchical',
+    save_path = './lunar_hierarchical_actor.pt',
+    use_wandb = False,
+    wandb_project = 'lunar-hierarchical-evo'
 ):
     accelerator = Accelerator(cpu = cpu)
     is_main = accelerator.is_main_process
@@ -296,135 +689,114 @@ def main(
     if log_wandb:
         wandb.init(project = wandb_project, config = locals())
 
-    model = HierarchicalTransformer(
-        dim_in = 8,
-        dim = dim,
+    hierarchies = resolve_hierarchies(hierarchies)
+    assert len(hierarchies) == 2, 'configured for 2 hierarchy levels, e.g. (1, 4)'
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    actor = HierarchicalActor(
+        state_dim = 8,
+        hidden_dim = hidden_dim,
         num_actions = 4,
-        head_depth = head_depth,
-        trunk_depth = trunk_depth,
-        tail_depth = tail_depth,
-        trunk_update_every = trunk_update_every
+        num_internal_actions = num_internal_actions,
+        dim_latent = dim_latent,
+        low_rank = low_rank,
+        hierarchies = hierarchies,
+        phase_shifts = phase_shifts
     )
 
     env = LunarEnvironment(
-        repeats = 2,
-        vectorized = vectorized,
+        env_name = env_name,
         num_envs = num_envs,
-        rolling_window = rolling_window
+        max_steps = max_steps
     )
 
-    # partition parameters into head, trunk, tail
-
-    head_params = list(model.token_emb.parameters()) + list(model.head.parameters())
-    trunk_params = list(model.state_to_trunk.parameters()) + list(model.trunk.parameters()) + [model.trunk_update_emb] + list(model.trunk_gru.parameters()) + list(model.trunk_gru_norm.parameters()) + list(model.trunk_to_logits.parameters())
-    tail_params = list(model.tail.parameters()) + list(model.to_logits.parameters()) + list(model.trunk_action_gate.parameters())
-
-    head_param_ids = {id(p) for p in head_params}
-    trunk_param_ids = {id(p) for p in trunk_params}
-    tail_param_ids = {id(p) for p in tail_params}
-
-    assert len(head_param_ids & trunk_param_ids) == 0, 'head and trunk parameters overlap'
-    assert len(head_param_ids & tail_param_ids) == 0, 'head and tail parameters overlap'
-    assert len(trunk_param_ids & tail_param_ids) == 0, 'trunk and tail parameters overlap'
-
-    all_params = list(model.parameters())
-    assert len(head_params) + len(trunk_params) + len(tail_params) == len(all_params), 'some parameters are not partitioned'
-
-    params_dict = dict(
-        all = all_params,
-        head = head_params,
-        trunk = trunk_params,
-        tail = tail_params
-    )
-
-    evo_kwargs = dict(
+    cma = CMAEvoStrategy(
+        actor,
         environment = env,
-        cpu = cpu,
+        params_to_optimize = actor.level_parameters(),
         num_generations = 1,
-        noise_population_size = noise_population_size,
-        noise_low_rank = 2,
+        population_size = population_size,
         noise_scale = noise_scale,
-        noise_scale_clamp_range = (5e-3, 2e-2),
-        learned_noise_scale = True,
-        use_sigma_optimizer = True,
-        learning_rate = learning_rate,
-        noise_scale_learning_rate = 1e-4,
-        use_scheduler = False,
-        verbose = False,
+        lora_rank = None,
+        sep_cma = True,
+        freeze_base = True,
+        mirror_sampling = True,
+        rollout_fixed_seed = True,
+        cpu = cpu,
         accelerator = accelerator,
-        sync_on_init = True
+        verbose = False
     )
-
-    print('Setting up EvoStrategy wrappers...')
-
-    evo = EvoStrategy(model, params_to_optimize = params_dict, **evo_kwargs)
-
-    # schedule
 
     phases = parse_string_schedule(phase_schedule)
-    total_generations = len(phases)
-    phase_gen = cycle(phases)
+    _, current_return, init_ep_rets = env.evaluate(actor)
 
-    print('\n--- Training Phase Schedule ---')
-    print(f'Schedule: {phase_schedule}')
-    print(f'Total Generations: {total_generations}')
-    print(f'Trunk updates every: {trunk_update_every} steps')
-    print(f'Population Size: {noise_population_size}')
-    print('-------------------------------\n')
+    if is_main:
+        print('\n--- Hierarchical Alternating Evolution (2 Levels) ---')
+        print(f'Hierarchies: {hierarchies} | Schedule: {phase_schedule} ({len(phases)} phases)')
+        print(f'Population Size: {population_size} | Initial Return: {current_return:+.1f} (max ep: {init_ep_rets.max():+.1f})')
+        print('-----------------------------------------------------\n', flush = True)
 
-    # checkpointing
+    start_time = time.time()
+    global_gen = 0
 
-    start_gen = 1
-    if os.path.exists(checkpoint_file):
+    for phase_index, (phase, num_gens) in enumerate(phases, start = 1):
+        level_index = 1 if phase == 'level_1' else 0
+        if phase in ('level_1', 'all'):
+            actor.enable_level_(1)
+
+        start_return = current_return
+        global_gen += num_gens
+
+        cma(num_generations = num_gens, scope = phase, verbose = False)
+        _, current_return, end_ep_rets = env.evaluate(actor)
+
+        delta_return = current_return - start_return
+        max_ep_return = float(end_ep_rets.max())
+        landed_pct = 100. * float((end_ep_rets >= 0.).mean())
+        elapsed = time.time() - start_time
+
+        phase_label = f'level_{level_index} (dt={hierarchies[level_index]})' if phase != 'all' else 'all'
         if is_main:
-            print(f'Loading warmup checkpoint from {checkpoint_file}...')
-
-        checkpoint = torch.load(checkpoint_file, map_location = 'cpu', weights_only = True)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        start_gen = checkpoint['generation'] + 1
-
-        for _ in range(start_gen - 1):
-            next(phase_gen)
-
-    pbar = tqdm(total = total_generations, desc = 'Generations')
-    pbar.update(start_gen - 1)
-
-    running_rewards = deque(maxlen = rolling_window)
-
-    for gen in range(start_gen, total_generations + 1):
-        phase = next(phase_gen)
-
-        fitnesses = evo(num_generations = 1, scope = phase, verbose = False)
-        avg_fit = fitnesses.mean().item()
-
-        running_rewards.append(avg_fit)
-        avg_reward = sum(running_rewards) / len(running_rewards)
-        avg_steps = env.avg_steps
-
-        pbar.set_postfix(phase = phase, avg_reward = round(avg_reward, 2), avg_steps = round(avg_steps, 1))
-        pbar.update(1)
+            print(
+                f'Phase {phase_index:2d} [{phase_label:15s}]: '
+                f'start = {start_return:+6.1f} -> end = {current_return:+6.1f} '
+                f'(delta = {delta_return:+6.1f}) | max_ep = {max_ep_return:+6.1f} | '
+                f'pos_ep = {landed_pct:4.1f}% [{elapsed:.1f}s]',
+                flush = True
+            )
 
         if log_wandb:
             wandb.log(dict(
-                generation = gen,
-                phase_str = phase,
-                phase = {'all': 0, 'head': 1, 'trunk': 2, 'tail': 3}.get(phase, -1),
-                avg_fitness = avg_fit,
-                avg_reward_window = avg_reward,
-                avg_steps = avg_steps,
+                phase = phase_index,
+                scope = phase,
+                stride = hierarchies[level_index],
+                generation = global_gen,
+                start_return = start_return,
+                end_return = current_return,
+                delta = delta_return,
+                max_episode_return = max_ep_return,
+                positive_episode_pct = landed_pct,
+                avg_steps = env.avg_steps
             ))
 
-        if gen == save_checkpoint_at and is_main:
-            torch.save(dict(
-                model_state_dict = model.state_dict(),
-                generation = gen
-            ), checkpoint_file)
-            print(f'\nSaved warmup checkpoint to {checkpoint_file}')
+    if is_main:
+        torch.save(dict(
+            actor = actor.state_dict(),
+            hierarchies = hierarchies
+        ), save_path)
+
+        if render:
+            record_best_episode_video(
+                actor,
+                env_name = env_name,
+                video_folder = video_folder,
+                max_timesteps = max_steps
+            )
 
     if log_wandb:
         wandb.finish()
-
-    # cleanup
 
     if dist.is_initialized():
         dist.destroy_process_group()
