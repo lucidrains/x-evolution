@@ -213,4 +213,15 @@ Special thanks to [Pollen Robotics 🤗](https://www.pollen-robotics.com/) for t
 }
 ```
 
+```bibtex
+@inproceedings{anonymous2026continual,
+    title   = {Continual Reinforcement Learning with Neuroevolution},
+    author  = {Anonymous},
+    booktitle = {Submitted to The Fifteenth International Conference on Learning Representations},
+    year    = {2026},
+    url     = {https://openreview.net/forum?id=UxsGk4on0e},
+    note    = {under review}
+}
+```
+
 *Nothing makes sense except in the light of evolution* - Theodosius Dobzhansky
