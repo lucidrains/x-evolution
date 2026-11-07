@@ -68,6 +68,136 @@ def test_evo_strat_vectorized_environment(vector_size):
 
     evo_strat()
 
+@param('noise_dtype', (torch.float16, torch.bfloat16, torch.int8))
+def test_quantized_noise(noise_dtype, tmp_path):
+    from x_evolution.x_evolution import EvoStrategy
+
+    torch.manual_seed(0)
+
+    model = nn.Linear(1, 1, bias = False)
+
+    def environment(m):
+        return -((m.model.weight - 1.) ** 2).mean().item()
+
+    evo_strat = EvoStrategy(
+        model,
+        environment = environment,
+        num_generations = 30,
+        noise_population_size = 16,
+        learning_rate = 1e-1,
+        noise_scale = 1e-1,
+        noise_dtype = noise_dtype,
+        fitness_to_weighted_factor = 'centered_rank',
+        cpu = True,
+        verbose = False,
+        checkpoint_path = str(tmp_path)
+    )
+
+    initial_loss = ((model.weight - 1.) ** 2).mean().item()
+    evo_strat()
+
+    final_loss = ((model.weight - 1.) ** 2).mean().item()
+
+    assert final_loss < initial_loss * 5e-2
+
+    noise = evo_strat.noisable_model.create_noise_((4, 4))
+
+    assert noise.dtype == noise_dtype
+
+    if noise_dtype == torch.int8:
+        assert torch.equal(noise, noise.round())
+
+def test_evo_strategy_rollback_is_in_memory(tmp_path):
+    from x_evolution.x_evolution import EvoStrategy
+
+    model = nn.Linear(2, 1, bias = False)
+    before = {name: value.clone() for name, value in model.state_dict().items()}
+
+    def environment(m):
+        return -((m.model.weight - 1.) ** 2).mean().item()
+
+    evo_strat = EvoStrategy(
+        model,
+        environment = environment,
+        num_generations = 1,
+        noise_population_size = 2,
+        cpu = True,
+        verbose = False,
+        checkpoint_path = str(tmp_path)
+    )
+
+    evo_strat(rollback_model_at_end = True)
+
+    for name, value in model.state_dict().items():
+        assert torch.equal(value, before[name])
+
+    # rollback stays in memory
+
+    assert not (tmp_path / 'initial.model.pt').exists()
+
+def test_nested_es_meta(tmp_path):
+    depth = 3
+    torch.manual_seed(0)
+
+    model = nn.Linear(1, 1, bias = False)
+    x = torch.ones(1, 1)
+    y = torch.ones(1, 1)
+
+    def loss(m):
+        with torch.no_grad():
+            return ((m(x) - y) ** 2).mean().item()
+
+    records = {level: [] for level in range(depth + 1)}
+
+    def make_level(module, level):
+        def on_generation(_, __, m):
+            records[level].append(loss(m))
+
+        def environment(m):
+            if level == 0:
+                return -loss(m)
+
+            inner = make_level(m, level - 1)
+            inner(rollback_model_at_end = True)
+
+            # selection sees inner endpoint, rollback keeps innate weights
+            return -records[level - 1][-1]
+
+        return CMAEvoStrategy(
+            module,
+            environment = environment,
+            num_generations = 4,
+            population_size = 2,
+            noise_scale = 1e-1,
+            lora_rank = None,
+            freeze_base = False,
+            mirror_sampling = False,
+            on_generation = on_generation,
+            cpu = True,
+            verbose = False,
+            checkpoint_path = str(tmp_path / f'level-{level}')
+        )
+
+    initial_loss = loss(model)
+    outer = make_level(model, depth)
+    outer()
+    final_loss = loss(model)
+
+    assert final_loss < initial_loss
+
+    # each level improves over its own run
+
+    for level in range(depth + 1):
+        assert records[level]
+        assert records[level][-1] < records[level][0]
+
+    # calls per level
+
+    assert len(records[0]) == 2048
+    assert len(records[1]) == 256
+    assert len(records[2]) == 32
+    assert len(records[3]) == 4
+
 def test_evo_strat_rejected_generation_advances():
     from x_evolution.x_evolution import EvoStrategy
 
@@ -372,6 +502,45 @@ def test_cma_merge_every_requires_freeze_base():
             checkpoint_path = './checkpoints/test-cma-merge'
         )
 
+
+@param('noise_dtype', (torch.float16, torch.bfloat16, torch.int8))
+def test_cma_quantized_noise(noise_dtype, tmp_path):
+    torch.manual_seed(0)
+
+    model = nn.Linear(4, 3, bias = False)
+    base = model.weight.detach().clone()
+    teacher = base + torch.randn(3, 1) @ torch.randn(1, 4)
+
+    def environment(m):
+        return -((m.weight - teacher) ** 2).mean()
+
+    cma = CMAEvoStrategy(
+        model,
+        environment = environment,
+        num_generations = 60,
+        population_size = 8,
+        noise_scale = 1e-1,
+        noise_dtype = noise_dtype,
+        lora_rank = 1,
+        cpu = True,
+        verbose = False,
+        checkpoint_path = str(tmp_path)
+    )
+
+    _, z, _ = cma.sample_(8, torch.Generator().manual_seed(0))
+
+    assert z.dtype == noise_dtype
+
+    if noise_dtype == torch.int8:
+        assert torch.equal(z, z.round())
+
+    initial_distance = (model.weight - teacher).norm().item()
+
+    cma()
+
+    final_distance = (model.weight - teacher).norm().item()
+
+    assert final_distance < initial_distance * 5e-2
 
 def test_cma_noise_scale_is_weight_space_std():
     model = nn.Linear(16, 12, bias = False)

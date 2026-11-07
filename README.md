@@ -34,7 +34,8 @@ evo_strat = EvoStrategy(
     noise_scale = 1e-2,         # the scale of the perturbation noise, also the initial noise scale (sigma) if `learned_noise_scale` = True
     num_generations = 100,    # number of generations / training steps
     learning_rate = 1e-3,     # scale on update derived by fitness and perturb noises
-    params_to_optimize = None # defaults to all parameters, but can be [str {param name}] or [Parameter]
+    params_to_optimize = None, # defaults to all parameters, but can be [str {param name}] or [Parameter]
+    noise_dtype = None        # torch.float16 / torch.bfloat16 / torch.int8 for quantized noise - https://arxiv.org/abs/2602.03120
 )
 
 # do evolution with your desired fitness function for so many generations
@@ -58,7 +59,8 @@ cma = CMAEvoStrategy(
     num_generations = 100,
     lora_rank = 1,          # None for the full weight update
     freeze_base = True,     # False recenters the base every generation
-    noise_scale = 1e-2      # std of the induced weight delta
+    noise_scale = 1e-2,     # std of the induced weight delta
+    noise_dtype = None      # torch.float16 / torch.bfloat16 / torch.int8 for quantized noise - https://arxiv.org/abs/2602.03120
 )
 
 cma()
@@ -121,6 +123,17 @@ $ uv run torchrun --nproc_per_node=8 train_microduck.py --resume True
 Special thanks to [Pollen Robotics 🤗](https://www.pollen-robotics.com/) for their open sourcing of such a polished sim2real env!
 
 ## Citations
+
+```bibtex
+@article{xu2026quantized,
+    title   = {Quantized Evolution Strategies: High-precision Fine-tuning of Quantized LLMs at Low-precision Cost},
+    author  = {Yinggan Xu and Kajetan Schweighofer and Risto Miikkulainen and Xin Qiu},
+    journal = {ArXiv},
+    year    = {2026},
+    volume  = {abs/2602.03120},
+    url     = {https://arxiv.org/abs/2602.03120}
+}
+```
 
 ```bibtex
 @article{Qiu2025EvolutionSA,

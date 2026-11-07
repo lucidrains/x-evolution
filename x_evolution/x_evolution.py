@@ -1,34 +1,26 @@
 from __future__ import annotations
-from typing import Literal, Any
-from collections.abc import Callable
 
+from collections.abc import Callable
+from functools import partial
 from math import ceil
 from pathlib import Path
-from functools import partial
+from typing import Any, Literal
 
 import torch
-from torch import tensor, Tensor, stack, arange, randint
+import torch.distributed as dist
+import torch.nn.functional as F
+from accelerate import Accelerator
+from beartype import beartype
+from beartype.door import is_bearable
+from einops import pack
+from torch import Tensor, arange, randint, stack, tensor
 from torch.nn import Module, ModuleList, Parameter, ParameterList
 from torch.optim import SGD, Optimizer
 from torch.optim.lr_scheduler import LRScheduler
-
-import torch.distributed as dist
-import torch.nn.functional as F
-
+from torch_einops_utils import pack_with_inverse
 from tqdm import tqdm
 
-from beartype import beartype
-from beartype.door import is_bearable
-
-from accelerate import Accelerator
-
-from x_mlps_pytorch.noisable import (
-    Noisable,
-    with_seed
-)
-
-from einops import pack
-from torch_einops_utils import pack_with_inverse
+from x_evolution.noisable import Noisable, with_seed
 
 # constants
 
@@ -152,10 +144,19 @@ class EvolutionStrategy(Module):
 
     def checkpoint(self, filename = 'evolved.model'):
         if self.accelerate.is_main_process:
+            self.checkpoint_folder.mkdir(parents = True, exist_ok = True)
             filepath = self.checkpoint_folder / f'{filename}.pt'
             torch.save(self.model.state_dict(), str(filepath))
 
         self.wait_for_everyone()
+
+    @torch.no_grad()
+    def snapshot_model_(self):
+        return {name: value.detach().clone() for name, value in self.model.state_dict().items()}
+
+    @torch.no_grad()
+    def restore_model_(self, state):
+        self.model.load_state_dict(state)
 
 # class
 
@@ -173,6 +174,7 @@ class EvoStrategy(EvolutionStrategy):
         mirror_sampling = True,
         params_to_optimize: dict[str, ParametersToOptimize] | ParametersToOptimize | None = None,
         noise_low_rank: int | None = None,
+        noise_dtype: torch.dtype | None = None, # float16 / bfloat16 / int8 - int8 stochastically rounds the noise
         rollout_fixed_seed = True,
         noise_scale = 1e-2,  # the noise scaling during rollouts with environment, todo - figure out right value and make sure it can also be customized per parameter name through a dict
         learned_noise_scale = False,
@@ -237,7 +239,7 @@ class EvoStrategy(EvolutionStrategy):
             model = ModuleList(model)
 
         self.model = model
-        self.noisable_model = Noisable(model, low_rank = noise_low_rank)
+        self.noisable_model = Noisable(model, low_rank = noise_low_rank, noise_dtype = noise_dtype)
 
         # maybe sync model params and buffers
 
@@ -442,7 +444,7 @@ class EvoStrategy(EvolutionStrategy):
 
                 # reproduce the noise from the seed
 
-                noise = with_seed(seed)(model.create_noise_fn)(shape, dtype = dtype)
+                noise = with_seed(seed)(model.create_noise_)(shape, dtype = dtype)
                 noise = noise.to(self.device)
 
                 # scale the weight
@@ -461,7 +463,7 @@ class EvoStrategy(EvolutionStrategy):
                 # maybe learned sigma
 
                 if self.learned_noise_scale:
-                    one_grad_sigma = weight * (noise ** 2 - 1) / noise_scale
+                    one_grad_sigma = weight * (noise.float() ** 2 - 1) / noise_scale
 
                     sigma_index = self.param_name_to_sigma_index[param_name]
                     sigma = self.sigmas[sigma_index]
@@ -524,8 +526,7 @@ class EvoStrategy(EvolutionStrategy):
 
         # maybe save model for rolling back (for meta-evo)
 
-        if rollback_model_at_end:
-            self.checkpoint('initial.model')
+        original_state = self.snapshot_model_() if rollback_model_at_end else None
 
         # maybe sigmas
 
@@ -600,7 +601,7 @@ class EvoStrategy(EvolutionStrategy):
                     fitnesses.append(None)
                     continue
 
-                def get_fitness(negate = False):
+                def get_fitness(negate = False, individual_seed = individual_seed, maybe_rollout_seed = maybe_rollout_seed):
                     nonlocal rewards_by_scope
 
                     individual_param_seeds = with_seed(individual_seed.item())(randint)(0, MAX_SEED_VALUE, (self.num_params,))
@@ -750,10 +751,8 @@ class EvoStrategy(EvolutionStrategy):
 
         # maybe rollback
 
-        if rollback_model_at_end:
-            orig_state_dict = torch.load(str(self.checkpoint_folder / 'initial.model.pt'), weights_only = True)
-
-            self.model.load_state_dict(orig_state_dict)
+        if exists(original_state):
+            self.restore_model_(original_state)
 
         # return fitnesses across generations
         # for meta-evolutionary (nesting EvoStrategy within the environment of another and optimizing some meta-network)

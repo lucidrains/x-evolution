@@ -1,32 +1,27 @@
 from __future__ import annotations
-from typing import Any
-from collections.abc import Callable
 
+from collections.abc import Callable
 from functools import reduce
 from math import ceil, exp, log, sqrt
 from pathlib import Path
+from typing import Any
 
 import torch
-from torch import Tensor, tensor, arange, randint
-from torch.nn import Module, ModuleList
-
-from tqdm import tqdm
-
-from beartype import beartype
-
 from accelerate import Accelerator
-
-from x_mlps_pytorch.noisable import with_seed
-
+from beartype import beartype
+from torch import Tensor, arange, randint, tensor
+from torch.nn import Module, ModuleList
 from torch_einops_utils import (
     batched_index_select,
     cast_item,
     dict_add,
     safe_cat,
     safe_stack,
-    tree_map_tensor_to_device
+    tree_map_tensor_to_device,
 )
+from tqdm import tqdm
 
+from x_evolution.noisable import quantize_noise_, validate_noise_dtype, with_seed
 from x_evolution.x_evolution import (
     MAX_SEED_VALUE,
     EvolutionStrategy,
@@ -35,7 +30,7 @@ from x_evolution.x_evolution import (
     divisible_by,
     exists,
     identity,
-    resolve_rewards
+    resolve_rewards,
 )
 
 # full covariance cma-es over rank r adapters
@@ -54,6 +49,7 @@ class _CMAState:
         mirror_sampling,
         population_size,
         noise_scale,
+        noise_dtype,
         sigma_clamp_range
     ):
         self.strategy = strategy
@@ -63,6 +59,7 @@ class _CMAState:
         self.lora_rank = lora_rank
         self.freeze_base = freeze_base
         self.sep_cma = sep_cma
+        self.noise_dtype = noise_dtype
         self.sigma_clamp_range = sigma_clamp_range
 
         self.dim = 0
@@ -174,16 +171,28 @@ class _CMAState:
             param.data.copy_(base + delta.to(base.device))
 
     @torch.no_grad()
+    def sample_noise_(self, shape, generator):
+        noise_dtype = self.noise_dtype
+
+        if exists(noise_dtype) and not noise_dtype.is_floating_point:
+            noise = torch.randn(shape, generator = generator)
+            noise = quantize_noise_(noise, bits = torch.iinfo(noise_dtype).bits, generator = generator)
+        else:
+            noise = torch.randn(shape, generator = generator, dtype = default(noise_dtype, torch.float32))
+
+        return noise.to(self.strategy.cma_device)
+
+    @torch.no_grad()
     def sample_(self, num_samples, generator, mirror_sampling = None):
         mirror_sampling = default(mirror_sampling, self.mirror_sampling)
 
         if mirror_sampling:
             assert (num_samples % 2) == 0
             half = num_samples // 2
-            z_half = torch.randn(half, self.dim, generator = generator).to(self.strategy.cma_device)
+            z_half = self.sample_noise_((half, self.dim), generator)
             z = safe_cat((z_half, -z_half), dim = 0)
         else:
-            z = torch.randn(num_samples, self.dim, generator = generator).to(self.strategy.cma_device)
+            z = self.sample_noise_((num_samples, self.dim), generator)
 
         if self.sep_cma:
             y = z * self.C.sqrt()
@@ -307,6 +316,7 @@ class CMAEvoStrategy(EvolutionStrategy):
         num_generations,
         population_size: int | None = None,
         noise_scale = 1e-2,
+        noise_dtype: torch.dtype | None = None, # float16 / bfloat16 / int8 - int8 stochastically rounds the sampled noise
         lora_rank: int | None = 1,
         freeze_base = True,
         merge_every: int | None = None,  # fold mean into base every n generations
@@ -423,6 +433,8 @@ class CMAEvoStrategy(EvolutionStrategy):
 
         self.population_size = population_size
         self.noise_scale = noise_scale
+        validate_noise_dtype(noise_dtype)
+        self.noise_dtype = noise_dtype
         self.lora_rank = lora_rank
         self.freeze_base = freeze_base
         self.merge_every = merge_every
@@ -514,6 +526,7 @@ class CMAEvoStrategy(EvolutionStrategy):
                 mirror_sampling = self._mirror_sampling,
                 population_size = self.population_size,
                 noise_scale = self.noise_scale,
+                noise_dtype = self.noise_dtype,
                 sigma_clamp_range = self.sigma_clamp_range
             )
 
@@ -679,15 +692,9 @@ class CMAEvoStrategy(EvolutionStrategy):
     ):
         verbose = default(verbose, self.verbose)
 
-        model = self.model.to(self.device)
+        self.model.to(self.device)
 
-        original_state = None
-
-        if rollback_model_at_end:
-            original_state = {
-                name: value.detach().clone()
-                for name, value in model.state_dict().items()
-            }
+        original_state = self.snapshot_model_() if rollback_model_at_end else None
 
         self.to_cma_device_()
 
@@ -727,8 +734,8 @@ class CMAEvoStrategy(EvolutionStrategy):
             )
             all_fitnesses.append(fitnesses)
 
-        if rollback_model_at_end and exists(original_state):
-            self.model.load_state_dict(original_state)
+        if exists(original_state):
+            self.restore_model_(original_state)
 
         if len(all_fitnesses) == 1:
             return all_fitnesses[0]
